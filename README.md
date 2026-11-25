@@ -134,6 +134,7 @@ rate = 48000
 | `crimp ui` | Otevře grafickou aplikaci `crimp-ui` |
 | `crimp doctor` | Ověří distribuci, `libpipewire-0.3`, socket, display a detekuje audio hardware |
 | `crimp auto [--apply]` | Automaticky navrhne (a s `--apply` uloží) bezpečná pravidla pro daný PC |
+| `crimp update [--check] [--force]` | Zkontroluje a nainstaluje nejnovější verzi z GitHubu (včetně restartu služby) |
 | `crimp settings [--json]` | Vypíše všechna živá PipeWire `Core` & `Metadata` nastavení a latenci |
 | `crimp set-setting <KLÍČ> <VAL\|auto>` | Živě změní PipeWire `settings` klíč (např. `clock.min-quantum 64`) |
 | `crimp set-default-sink <NAME\|auto>` | Přepne `default.audio.sink` |

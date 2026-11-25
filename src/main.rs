@@ -6,6 +6,7 @@ use crimp_proto::ipc::{
     DefaultDeviceKind, DspOverrideChange, IpcRequest, IpcResponse, MetadataTarget,
     resolve_socket_path, send_request, start_ipc_server,
 };
+use crimp_proto::update;
 use pw_thread::{PwCommand, spawn_pw_thread};
 use std::env;
 use std::path::PathBuf;
@@ -27,6 +28,10 @@ enum CliAction {
     Auto {
         socket_path: Option<String>,
         apply: bool,
+    },
+    Update {
+        check_only: bool,
+        force: bool,
     },
     Check {
         config_path: Option<PathBuf>,
@@ -98,6 +103,7 @@ fn main() -> ExitCode {
         CliAction::Ui => launch_gui(),
         CliAction::Doctor { socket_path } => run_doctor(socket_path),
         CliAction::Auto { socket_path, apply } => run_auto(socket_path, apply),
+        CliAction::Update { check_only, force } => run_update(check_only, force),
         CliAction::Check { config_path } => run_check(config_path),
         CliAction::Daemon {
             config_path,
@@ -279,6 +285,47 @@ fn run_auto(socket_override: Option<String>, apply: bool) -> ExitCode {
             ExitCode::FAILURE
         }
         _ => ExitCode::FAILURE,
+    }
+}
+
+fn run_update(check_only: bool, force: bool) -> ExitCode {
+    println!("Kontroluji aktualizace Crimp na GitHubu...");
+    match update::check_for_updates() {
+        Ok(info) => {
+            println!(
+                "  Aktuální verze : {}\n  Dostupná verze : {} ({})",
+                info.current_version, info.latest_version, info.source_label
+            );
+            if !info.update_available && !force {
+                println!("Crimp je aktuální.");
+                return ExitCode::SUCCESS;
+            }
+            if check_only {
+                if info.update_available {
+                    println!("Je dostupná aktualizace: v{}", info.latest_version);
+                }
+                return ExitCode::SUCCESS;
+            }
+        }
+        Err(err) if !force || check_only => {
+            eprintln!("Kontrola aktualizací selhala: {err}");
+            return ExitCode::FAILURE;
+        }
+        Err(err) => {
+            eprintln!("Varování při kontrole verze ({err}), vynucuji aktualizaci z GitHubu...");
+        }
+    }
+
+    println!("Stahuji a instaluji nejnovější verzi...");
+    match update::run_self_update() {
+        Ok(msg) => {
+            println!("{msg}");
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("{err}");
+            ExitCode::FAILURE
+        }
     }
 }
 
@@ -738,6 +785,8 @@ fn parse_cli(args: &[String]) -> Result<CliAction, String> {
     let mut socket_path: Option<String> = None;
     let mut json = false;
     let mut apply = false;
+    let mut force = false;
+    let mut check_only = false;
     let mut positional: Vec<String> = Vec::new();
 
     let mut i = 0;
@@ -747,6 +796,8 @@ fn parse_cli(args: &[String]) -> Result<CliAction, String> {
             "-V" | "--version" => return Ok(CliAction::Version),
             "--json" => json = true,
             "--apply" => apply = true,
+            "--force" => force = true,
+            "--check" => check_only = true,
             "-c" | "--config" => {
                 i += 1;
                 let val = args.get(i).ok_or("--config vyžaduje cestu")?;
@@ -771,6 +822,7 @@ fn parse_cli(args: &[String]) -> Result<CliAction, String> {
         "ui" | "gui" => Ok(CliAction::Ui),
         "doctor" => Ok(CliAction::Doctor { socket_path }),
         "auto" => Ok(CliAction::Auto { socket_path, apply }),
+        "update" => Ok(CliAction::Update { check_only, force }),
         "daemon" => Ok(CliAction::Daemon {
             config_path,
             socket_path,
@@ -885,6 +937,7 @@ fn print_usage() {
           ui                          Otevře lehkou grafickou aplikaci (crimp-ui)\n  \
           doctor                      Ověří kompatibilitu OS, PipeWire, Wayland/X11 a detekci audia\n  \
           auto [--apply]              Automaticky detekuje výstup/mic/HDMI a navrhne (nebo zapíše) pravidla\n  \
+          update [--check] [--force]  Zkontroluje a nainstaluje nejnovější verzi z GitHubu\n  \
           check                       Ověří syntaxi a validitu rules.toml bez PipeWire\n  \
           status                      Zobrazí stav běžícího daemona přes IPC\n  \
           settings                    Vypíše živá PipeWire Clock, Metadata a výchozí zařízení\n  \

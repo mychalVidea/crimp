@@ -1,6 +1,7 @@
 use crimp_proto::config::Config;
 use crimp_proto::graph::{DeniedRecord, GraphSnapshot, PwRuntimeState};
 use crimp_proto::ipc::{DaemonStatus, IpcRequest, IpcResponse, resolve_socket_path, send_request};
+use crimp_proto::update::{self, UpdateInfo};
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{Arc, Mutex, mpsc};
@@ -16,6 +17,9 @@ pub struct UiSnapshot {
     pub pw_settings: Option<PwRuntimeState>,
     pub config: Option<Config>,
     pub denied_history: Vec<DeniedRecord>,
+    pub update_info: Option<UpdateInfo>,
+    pub update_in_progress: bool,
+    pub restart_ready: bool,
 }
 
 #[derive(Debug)]
@@ -26,6 +30,8 @@ pub struct ActionFeedback {
 
 enum ClientMsg {
     RefreshNow,
+    CheckUpdates,
+    RunUpdate,
     Command {
         req: IpcRequest,
         feedback_tx: mpsc::Sender<ActionFeedback>,
@@ -33,7 +39,7 @@ enum ClientMsg {
     Shutdown,
 }
 
-/// Asynchronní IPC klient oddělující I/O na Unix socketu od vykreslovací smyčky `egui`.
+/// Asynchronní IPC a update klient oddělující síťové i socket operace od vykreslovací smyčky `egui`.
 pub struct CrimpClient {
     socket_path: PathBuf,
     snapshot: Arc<Mutex<UiSnapshot>>,
@@ -52,16 +58,89 @@ impl CrimpClient {
 
         let (msg_tx, msg_rx) = mpsc::channel::<ClientMsg>();
         let (feedback_tx, feedback_rx) = mpsc::channel::<ActionFeedback>();
+        let feedback_bg = feedback_tx.clone();
 
         let _ = thread::Builder::new()
             .name("crimp-ui-ipc".into())
             .spawn(move || {
+                // První tichá kontrola aktualizací hned po startu aplikace.
+                if let Ok(info) = update::check_for_updates()
+                    && let Ok(mut guard) = snapshot_bg.lock()
+                {
+                    guard.update_info = Some(info);
+                }
+
                 loop {
                     poll_daemon(&sock_bg, &snapshot_bg);
                     ctx.request_repaint();
 
                     match msg_rx.recv_timeout(Duration::from_millis(750)) {
                         Ok(ClientMsg::RefreshNow) => continue,
+                        Ok(ClientMsg::CheckUpdates) => {
+                            let res = match update::check_for_updates() {
+                                Ok(info) => {
+                                    let msg = if info.update_available {
+                                        format!(
+                                            "Dostupná aktualizace v{} (aktuální {})",
+                                            info.latest_version, info.current_version
+                                        )
+                                    } else {
+                                        format!(
+                                            "Crimp {} je aktuální ({})",
+                                            info.current_version, info.source_label
+                                        )
+                                    };
+                                    if let Ok(mut guard) = snapshot_bg.lock() {
+                                        guard.update_info = Some(info);
+                                    }
+                                    ActionFeedback {
+                                        is_error: false,
+                                        message: msg,
+                                    }
+                                }
+                                Err(err) => ActionFeedback {
+                                    is_error: true,
+                                    message: err,
+                                },
+                            };
+                            let _ = feedback_bg.send(res);
+                            ctx.request_repaint();
+                        }
+                        Ok(ClientMsg::RunUpdate) => {
+                            if let Ok(mut guard) = snapshot_bg.lock() {
+                                guard.update_in_progress = true;
+                            }
+                            let _ = feedback_bg.send(ActionFeedback {
+                                is_error: false,
+                                message: "Stahuji a instaluji nejnovější verzi z GitHubu...".into(),
+                            });
+                            ctx.request_repaint();
+
+                            let res = match update::run_self_update() {
+                                Ok(msg) => {
+                                    if let Ok(mut guard) = snapshot_bg.lock() {
+                                        guard.update_in_progress = false;
+                                        guard.restart_ready = true;
+                                    }
+                                    ActionFeedback {
+                                        is_error: false,
+                                        message: msg,
+                                    }
+                                }
+                                Err(err) => {
+                                    if let Ok(mut guard) = snapshot_bg.lock() {
+                                        guard.update_in_progress = false;
+                                    }
+                                    ActionFeedback {
+                                        is_error: true,
+                                        message: err,
+                                    }
+                                }
+                            };
+                            let _ = feedback_bg.send(res);
+                            poll_daemon(&sock_bg, &snapshot_bg);
+                            ctx.request_repaint();
+                        }
                         Ok(ClientMsg::Command { req, feedback_tx }) => {
                             let res = match send_request(&sock_bg, &req) {
                                 Ok(IpcResponse::Ok { message }) => ActionFeedback {
@@ -116,6 +195,14 @@ impl CrimpClient {
         let _ = self.msg_tx.send(ClientMsg::RefreshNow);
     }
 
+    pub fn check_updates(&self) {
+        let _ = self.msg_tx.send(ClientMsg::CheckUpdates);
+    }
+
+    pub fn trigger_self_update(&self) {
+        let _ = self.msg_tx.send(ClientMsg::RunUpdate);
+    }
+
     pub fn send_command(&self, req: IpcRequest) {
         let _ = self.msg_tx.send(ClientMsg::Command {
             req,
@@ -145,6 +232,14 @@ impl CrimpClient {
             .spawn()
             .map(|_| ())
             .map_err(|e| format!("Nelze spustit '{}': {e}", binary.display()))
+    }
+
+    pub fn restart_gui_process(&self) -> Result<(), String> {
+        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+        Command::new(exe)
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| format!("Nelze znovu spustit UI: {e}"))
     }
 }
 
