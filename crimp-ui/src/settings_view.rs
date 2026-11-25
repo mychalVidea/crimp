@@ -1,3 +1,4 @@
+use crate::autostart::AutostartState;
 use crate::client::CrimpClient;
 use crate::theme;
 use crimp_proto::config::Config;
@@ -35,8 +36,11 @@ impl SettingsViewState {
         runtime: Option<&PwRuntimeState>,
         graph: Option<&GraphSnapshot>,
         config: Option<&Config>,
+        autostart: &AutostartState,
         client: &CrimpClient,
-    ) {
+    ) -> bool {
+        let mut reload_all_clicked = false;
+
         if let Some(rt) = runtime
             && !self.initialized_from_runtime
         {
@@ -48,6 +52,64 @@ impl SettingsViewState {
         }
 
         ScrollArea::vertical().show(ui, |ui| {
+            // 0. Spuštění při startu systému & Tichá tray ikona
+            theme::card_frame().show(ui, |ui| {
+                theme::section_label(ui, "Start se systémem & Pravidla");
+                ui.add_space(6.0);
+                let mut enabled = autostart.is_fully_enabled();
+                if ui
+                    .checkbox(
+                        &mut enabled,
+                        "Spouštět Crimp při startu systému (pravidla na pozadí + tray ikona, GUI zůstane zavřené)",
+                    )
+                    .on_hover_text(
+                        "Zapne službu crimp.service (automaticky aplikuje pravidla, bloklisty a virtuální sběrnice ihned po přihlášení) a přidá lehkou tray ikonu do ~/.config/autostart/crimp-tray.desktop. Samotné okno Patchbaye se po startu PC neotevře.",
+                    )
+                    .changed()
+                {
+                    client.set_autostart(enabled);
+                }
+
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    let (svc_lbl, svc_col) = if autostart.daemon_enabled {
+                        ("Služba crimp.service: aktivní", theme::ECONOMY_GREEN)
+                    } else {
+                        ("Služba crimp.service: vypnuta", theme::TEXT_SUBTLE)
+                    };
+                    ui.label(egui::RichText::new(svc_lbl).size(11.5).color(svc_col));
+                    theme::spec_divider(ui);
+                    let (tray_lbl, tray_col) = if autostart.tray_enabled {
+                        ("Tray autostart: aktivní", theme::ECONOMY_GREEN)
+                    } else {
+                        ("Tray autostart: vypnut", theme::TEXT_SUBTLE)
+                    };
+                    ui.label(egui::RichText::new(tray_lbl).size(11.5).color(tray_col));
+                });
+
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .button("Načíst všechna pravidla a rozložení")
+                        .on_hover_text(
+                            "Okamžitě znovu načte rules.toml v daemonu (aplikuje routování, blokace i aliasy) a obnoví uložené rozložení karet v Patchbayi.",
+                        )
+                        .clicked()
+                    {
+                        reload_all_clicked = true;
+                    }
+                    ui.label(
+                        egui::RichText::new(
+                            "Načte rules.toml v daemonu i uložené pozice karet z disku",
+                        )
+                        .size(11.5)
+                        .color(theme::TEXT_MUTED),
+                    );
+                });
+            });
+
+            ui.add_space(10.0);
+
             // 1. Přehled PipeWire Serveru a Latence
             theme::card_frame().show(ui, |ui| {
                 theme::section_label(ui, "PipeWire Server & Živý Stav");
@@ -425,6 +487,8 @@ impl SettingsViewState {
                 });
             }
         });
+
+        reload_all_clicked
     }
 }
 

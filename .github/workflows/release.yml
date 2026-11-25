@@ -2,6 +2,8 @@ name: Release Crimp Packages
 
 on:
   push:
+    branches:
+      - main
     tags:
       - 'v*'
   workflow_dispatch:
@@ -11,7 +13,7 @@ permissions:
 
 jobs:
   build-linux:
-    name: Build Linux Package (${{ matrix.target }})
+    name: Build Linux Prepackage (${{ matrix.target }})
     runs-on: ubuntu-22.04
     strategy:
       matrix:
@@ -32,13 +34,19 @@ jobs:
       - name: Install Rust 1.100+ toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Run core tests & build workspace release binaries
+      - name: Run core tests & build release binaries with build metadata
+        env:
+          CRIMP_BUILD_COMMIT: ${{ github.sha }}
         run: |
+          export CRIMP_BUILD_COMMIT="${GITHUB_SHA::7}"
           cargo test --workspace --locked
           cargo build --release --workspace --locked
 
-      - name: Package .tar.gz bundle (crimp + crimp-ui + desktop)
+      - name: Package .tar.gz bundle & version.json manifest
         run: |
+          VERSION="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
+          SHORT_SHA="${GITHUB_SHA::7}"
+          BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           STAGE="crimp-linux-${{ matrix.arch }}"
           mkdir -p "$STAGE/contrib"
           install -Dm755 target/release/crimp "$STAGE/crimp"
@@ -48,15 +56,15 @@ jobs:
           install -Dm644 contrib/crimp.service "$STAGE/contrib/crimp.service"
           install -Dm644 README.md "$STAGE/README.md"
           install -Dm644 LICENSE "$STAGE/LICENSE"
+          printf '{"version":"%s","commit":"%s","build_time":"%s"}\n' \
+            "$VERSION" "$SHORT_SHA" "$BUILD_TIME" > version.json
+          install -Dm644 version.json "$STAGE/version.json"
           tar -czf "${STAGE}.tar.gz" "$STAGE"
           sha256sum "${STAGE}.tar.gz" > "${STAGE}.tar.gz.sha256"
 
       - name: Build .deb package
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          if [ "${GITHUB_REF_NAME}" = "${GITHUB_REF#refs/heads/}" ] || [ -z "$VERSION" ]; then
-            VERSION="0.2.0"
-          fi
+          VERSION="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
           DEB_DIR="crimp_${VERSION}_${{ matrix.deb_arch }}"
           mkdir -p "${DEB_DIR}/DEBIAN" \
                    "${DEB_DIR}/usr/bin" \
@@ -80,11 +88,25 @@ jobs:
             > "${DEB_DIR}/DEBIAN/control"
           dpkg-deb --build "${DEB_DIR}"
 
-      - name: Upload GitHub Release assets
+      - name: Publish tagged release assets
         uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/v')
         with:
           files: |
             crimp-linux-${{ matrix.arch }}.tar.gz
             crimp-linux-${{ matrix.arch }}.tar.gz.sha256
+            version.json
+            crimp_*.deb
+
+      - name: Update rolling latest prepackage on main commit
+        uses: softprops/action-gh-release@v2
+        if: github.ref == 'refs/heads/main'
+        with:
+          tag_name: latest
+          name: Crimp Latest Prepackage
+          body: "Automatický prekompilovaný balíček z posledního commitu na větvi `main` (${{ github.sha }})."
+          files: |
+            crimp-linux-${{ matrix.arch }}.tar.gz
+            crimp-linux-${{ matrix.arch }}.tar.gz.sha256
+            version.json
             crimp_*.deb

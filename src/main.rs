@@ -288,13 +288,22 @@ fn run_auto(socket_override: Option<String>, apply: bool) -> ExitCode {
     }
 }
 
+fn format_ver_commit(ver: &str, commit: Option<&str>) -> String {
+    match commit {
+        Some(c) if !c.is_empty() => format!("{ver} ({c})"),
+        _ => ver.to_string(),
+    }
+}
+
 fn run_update(check_only: bool, force: bool) -> ExitCode {
     println!("Kontroluji aktualizace Crimp na GitHubu...");
     match update::check_for_updates() {
         Ok(info) => {
             println!(
                 "  Aktuální verze : {}\n  Dostupná verze : {} ({})",
-                info.current_version, info.latest_version, info.source_label
+                format_ver_commit(&info.current_version, info.current_commit.as_deref()),
+                format_ver_commit(&info.latest_version, info.latest_commit.as_deref()),
+                info.source_label
             );
             if !info.update_available && !force {
                 println!("Crimp je aktuální.");
@@ -302,7 +311,10 @@ fn run_update(check_only: bool, force: bool) -> ExitCode {
             }
             if check_only {
                 if info.update_available {
-                    println!("Je dostupná aktualizace: v{}", info.latest_version);
+                    println!(
+                        "Je dostupná aktualizace: v{}",
+                        format_ver_commit(&info.latest_version, info.latest_commit.as_deref())
+                    );
                 }
                 return ExitCode::SUCCESS;
             }
@@ -473,11 +485,13 @@ fn run_daemon(custom_config: Option<PathBuf>, custom_socket: Option<String>) -> 
                 output_port_id,
                 input_node_id,
                 input_port_id,
+                replace_input,
             } => match pw_for_ipc.create_manual_link(
                 output_node_id,
                 output_port_id,
                 input_node_id,
                 input_port_id,
+                replace_input,
             ) {
                 Ok(message) => IpcResponse::Ok { message },
                 Err(message) => IpcResponse::Error { message },

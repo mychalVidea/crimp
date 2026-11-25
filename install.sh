@@ -5,6 +5,7 @@ REPO="${CRIMP_REPO:-mychalVidea/crimp}"
 BIN_DIR="${HOME}/.local/bin"
 APP_DIR="${HOME}/.local/share/applications"
 ICON_DIR="${HOME}/.local/share/icons/hicolor/scalable/apps"
+DATA_DIR="${HOME}/.local/share/crimp"
 SERVICE_DIR="${HOME}/.config/systemd/user"
 
 ACTION="install"
@@ -86,10 +87,13 @@ if [ "$ACTION" = "uninstall" ]; then
   if command -v systemctl >/dev/null 2>&1; then
     systemctl --user disable --now crimp.service 2>/dev/null || true
   fi
+  pkill -f "crimp-ui --tray" 2>/dev/null || true
   rm -f "${BIN_DIR}/crimp" "${BIN_DIR}/crimp-ui" \
         "${APP_DIR}/crimp.desktop" \
+        "${HOME}/.config/autostart/crimp-tray.desktop" \
         "${ICON_DIR}/crimp.svg" \
-        "${SERVICE_DIR}/crimp.service"
+        "${SERVICE_DIR}/crimp.service" \
+        "${DATA_DIR}/installed.json"
   if command -v systemctl >/dev/null 2>&1; then
     systemctl --user daemon-reload 2>/dev/null || true
   fi
@@ -141,12 +145,15 @@ trap 'rm -rf "$TMP_DIR"' EXIT
 
 install_bundle() {
   local dir="$1"
-  mkdir -p "${BIN_DIR}" "${APP_DIR}" "${ICON_DIR}" "${SERVICE_DIR}"
+  mkdir -p "${BIN_DIR}" "${APP_DIR}" "${ICON_DIR}" "${SERVICE_DIR}" "${DATA_DIR}"
 
   install -Dm755 "${dir}/crimp" "${BIN_DIR}/crimp"
   install -Dm755 "${dir}/crimp-ui" "${BIN_DIR}/crimp-ui"
   install -Dm644 "${dir}/crimp.svg" "${ICON_DIR}/crimp.svg"
   install -Dm644 "${dir}/contrib/crimp.service" "${SERVICE_DIR}/crimp.service"
+  if [ -f "${dir}/version.json" ]; then
+    install -Dm644 "${dir}/version.json" "${DATA_DIR}/installed.json"
+  fi
 
   sed \
     -e "s|^Exec=.*|Exec=${BIN_DIR}/crimp-ui|" \
@@ -172,14 +179,19 @@ if ! find_libpipewire >/dev/null; then
   warn "V systému nebyla nalezena runtime knihovna libpipewire-0.3.so.0 – nainstalujte prosím PipeWire."
 fi
 
+PREPACKAGE_URL="https://github.com/${REPO}/releases/download/latest/crimp-linux-${ARCH}.tar.gz"
 RELEASE_URL="https://github.com/${REPO}/releases/latest/download/crimp-linux-${ARCH}.tar.gz"
-log "Stahuji balíček z GitHub Releases (${RELEASE_URL})..."
+log "Stahuji předkompilovaný balíček z GitHub Releases..."
 
-if curl -fsSL "${RELEASE_URL}" -o "${TMP_DIR}/crimp-release.tar.gz" 2>/dev/null; then
+if curl -fsSL "${PREPACKAGE_URL}" -o "${TMP_DIR}/crimp-release.tar.gz" 2>/dev/null \
+  || curl -fsSL "${RELEASE_URL}" -o "${TMP_DIR}/crimp-release.tar.gz" 2>/dev/null; then
   tar -xzf "${TMP_DIR}/crimp-release.tar.gz" -C "${TMP_DIR}"
   BUNDLE_DIR="${TMP_DIR}/crimp-linux-${ARCH}"
   if [ -x "${BUNDLE_DIR}/crimp" ] && [ -x "${BUNDLE_DIR}/crimp-ui" ]; then
     install_bundle "${BUNDLE_DIR}"
+    if systemctl --user is-active crimp-tray >/dev/null 2>&1; then
+      systemctl --user restart crimp-tray || true
+    fi
     log "Crimp byl úspěšně nainstalován z předkompilovaného balíčku."
     log "Spusť 'crimp doctor' nebo otevři aplikaci 'Crimp' v menu."
     exit 0

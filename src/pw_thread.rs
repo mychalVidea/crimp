@@ -81,6 +81,7 @@ pub enum PwCommand {
         output_port_id: u32,
         input_node_id: u32,
         input_port_id: u32,
+        replace_input: bool,
         reply: mpsc::SyncSender<Result<String, String>>,
     },
     DestroyManualLink {
@@ -208,6 +209,7 @@ impl PwHandle {
         output_port_id: u32,
         input_node_id: u32,
         input_port_id: u32,
+        replace_input: bool,
     ) -> Result<String, String> {
         let (tx, rx) = mpsc::sync_channel(1);
         self.send_command(PwCommand::CreateManualLink {
@@ -215,6 +217,7 @@ impl PwHandle {
             output_port_id,
             input_node_id,
             input_port_id,
+            replace_input,
             reply: tx,
         })?;
         rx.recv_timeout(Duration::from_secs(3))
@@ -739,6 +742,7 @@ impl DaemonState {
         output_port_id: u32,
         input_node_id: u32,
         input_port_id: u32,
+        replace_input: bool,
     ) -> Result<String, String> {
         let out_node = self.graph.node(output_node_id);
         let out_port = self.graph.port(output_port_id);
@@ -759,12 +763,37 @@ impl DaemonState {
             ));
         }
 
+        let mut replaced_count = 0usize;
+        if replace_input {
+            let conflicting_links: Vec<u32> = self
+                .graph
+                .links()
+                .filter(|link| {
+                    link.input_port_id == input_port_id && link.output_port_id != output_port_id
+                })
+                .map(|link| link.id)
+                .collect();
+
+            for old_id in conflicting_links {
+                if let Err(err) = self.registry.destroy_global(old_id).into_result() {
+                    warn!(old_id, error = ?err, "Nepodařilo se odpojit předchozí link ze vstupního portu");
+                } else {
+                    self.graph.remove_global(old_id);
+                    replaced_count += 1;
+                }
+            }
+        }
+
         if self
             .graph
             .find_link_between_ports(output_port_id, input_port_id)
             .is_some()
         {
-            return Ok("Link již existuje".to_string());
+            return Ok(if replaced_count > 0 {
+                format!("Předchozí linky ({replaced_count}) odpojeny, spojení zachováno")
+            } else {
+                "Link již existuje".to_string()
+            });
         }
 
         let link_factory = self
@@ -788,11 +817,21 @@ impl DaemonState {
             .insert((output_port_id, input_port_id), Instant::now());
         info!(
             output_node_id,
-            output_port_id, input_node_id, input_port_id, "Vytvořen ruční PipeWire link"
+            output_port_id,
+            input_node_id,
+            input_port_id,
+            replaced_count,
+            "Vytvořen ruční PipeWire link"
         );
-        Ok(format!(
-            "Vytvořen link {output_node_id}:{output_port_id} -> {input_node_id}:{input_port_id}"
-        ))
+        if replaced_count > 0 {
+            Ok(format!(
+                "Přepojeno na {output_node_id}:{output_port_id} -> {input_node_id}:{input_port_id} (předchozí kabel odpojen)"
+            ))
+        } else {
+            Ok(format!(
+                "Vytvořen link {output_node_id}:{output_port_id} -> {input_node_id}:{input_port_id}"
+            ))
+        }
     }
 
     fn destroy_manual_link(&mut self, link_id: u32) -> Result<String, String> {
@@ -1505,6 +1544,7 @@ fn run_single_pipewire_session(
             output_port_id,
             input_node_id,
             input_port_id,
+            replace_input,
             reply,
         } => {
             let res = state_cmd.borrow_mut().create_manual_link(
@@ -1512,6 +1552,7 @@ fn run_single_pipewire_session(
                 output_port_id,
                 input_node_id,
                 input_port_id,
+                replace_input,
             );
             let _ = reply.send(res);
         }

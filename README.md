@@ -39,6 +39,8 @@ Pro **Arch / CachyOS** je připraven [`contrib/PKGBUILD`](contrib/PKGBUILD), pro
 - **Kompletní PipeWire Settings inspektor & ovládání:** Živě čte PipeWire `Core` i `Metadata` (`settings` a `default`) — vidíš přesnou latenci v ms, aktivní quantum, sample rate, `clock.min-quantum`, `clock.max-quantum`, `clock.allowed-rates`, `clock.quantum-limit`, `default.audio.sink`, `default.audio.source` a všechny surové metadata klíče v jedné tabulce.
 - **Virtuální audio sběrnice (`[[virtual_sink]]`):** Deklarativní Null Sinky spravované přímo daemonem.
 - **Dynamické DSP profily (`[[dsp_profile]]`):** Např. při startu DAW automaticky sníží `clock.force-quantum` na `128`, po ukončení jej vrátí na výchozí.
+- **Prekompilované balíčky na GitHub Actions:** Každý push do `main` automaticky sestaví přenosný `.tar.gz` balíček pod rolling tagem `latest` (i tagy `v*`), takže se při `crimp update` nebo tlačítku **Update** v UI nic nemusí kompilovat lokálně (jen pokud je vzdálený build novější než nainstalovaný).
+- **Start se systémem & tichá tray ikona (`crimp-ui --tray`):** V *PipeWire Settings* lze jedním klikem zapnout autostart daemona (`crimp.service`) i lehké tray ikony (`~/.config/autostart/crimp-tray.desktop`) — po přihlášení se rovnou načtou všechna pravidla na pozadí a hlavní okno se neotvírá, dokud jej nevyvoláš z lišty nebo menu.
 - **Hot-reload & Unix IPC:** Změny v `~/.config/crimp/rules.toml` se načtou automaticky do 2 s nebo okamžitě přes `crimp reload` / tlačítko v UI.
 
 ---

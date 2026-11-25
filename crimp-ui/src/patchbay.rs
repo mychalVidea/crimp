@@ -85,6 +85,17 @@ impl PatchbayState {
         self.layout_dirty_since = None;
     }
 
+    /// Znovu načte uložené pozice uzlů, zoom a pan z `~/.config/crimp/ui-layout.json`.
+    pub fn reload_layout_from_disk(&mut self) {
+        self.saved = load_saved_layout();
+        self.positions.clear();
+        self.pan = arr_to_vec(self.saved.pan);
+        self.zoom = self.saved.zoom.clamp(0.45, 1.75);
+        self.hide_internal_and_midi = self.saved.hide_internal_and_midi;
+        self.needs_fit = self.saved.node_positions.is_empty();
+        self.layout_dirty_since = None;
+    }
+
     pub fn show(
         &mut self,
         ui: &mut egui::Ui,
@@ -361,9 +372,11 @@ impl PatchbayState {
         draw_subtle_grid(&painter, canvas_rect, self.pan, self.zoom);
 
         let mut port_screen_pos: HashMap<u32, Pos2> = HashMap::new();
-        let mut in_pin_rects: Vec<(u32, u32, Rect)> = Vec::new();
+        let mut in_pin_rects: Vec<(u32, u32, Pos2, Rect)> = Vec::new();
         let mut out_pin_rects: Vec<(u32, u32, Rect)> = Vec::new();
         let pointer_pos = ui.input(|i| i.pointer.hover_pos());
+        let mut dragging_any_node = false;
+        let mut hovering_any_node = false;
 
         // Kreslení karet uzlů
         for &node in visible_nodes {
@@ -428,17 +441,21 @@ impl PatchbayState {
             );
             painter.rect_filled(pill_rect, CornerRadius::same(2), accent);
 
-            let header_id = ui.scope_id().with(("node_drag", node.id));
-            let header_resp = ui.interact(header_rect, header_id, Sense::click_and_drag());
-            if header_resp.dragged()
-                && let Some(pos) = self.positions.get_mut(&node.id)
-            {
-                *pos += header_resp.drag_delta() / self.zoom;
-                self.mark_dirty();
-            }
-            if header_resp.clicked() {
+            // Celá karta uzlu je uchopitelná pro rychlé přesouvání (výstupní piny registrované níže mají přednost).
+            let card_id = ui.scope_id().with(("node_drag", node.id));
+            let card_resp = ui.interact(rect, card_id, Sense::click_and_drag());
+            if card_resp.drag_started() || card_resp.clicked() {
                 self.selected_node_id = Some(node.id);
                 self.selected_link_id = None;
+            }
+            if card_resp.dragged() {
+                dragging_any_node = true;
+                if let Some(pos) = self.positions.get_mut(&node.id) {
+                    *pos += card_resp.drag_delta() / self.zoom;
+                    self.mark_dirty();
+                }
+            } else if card_resp.hovered() {
+                hovering_any_node = true;
             }
 
             let title_x = header_rect.left() + 20.0 * self.zoom;
@@ -468,6 +485,9 @@ impl PatchbayState {
             let has_both = !in_ports.is_empty() && !out_ports.is_empty();
             let max_port_chars = if has_both { 15 } else { 28 };
             let rows = in_ports.len().max(out_ports.len());
+            let half_row = PORT_ROW_HEIGHT * 0.5 * self.zoom;
+            let in_reach = (if has_both { 112.0 } else { 132.0 }) * self.zoom;
+            let out_reach = (if has_both { 86.0 } else { 96.0 }) * self.zoom;
 
             for row in 0..rows {
                 let row_y = header_rect.bottom() + (row as f32 + 0.5) * PORT_ROW_HEIGHT * self.zoom;
@@ -475,57 +495,124 @@ impl PatchbayState {
                 if let Some(in_port) = in_ports.get(row) {
                     let pin_pos = Pos2::new(rect.left(), row_y);
                     port_screen_pos.insert(in_port.id, pin_pos);
-                    let hit_rect = Rect::from_center_size(pin_pos, Vec2::splat(16.0 * self.zoom));
-                    in_pin_rects.push((node.id, in_port.id, hit_rect));
+                    let hit_rect = Rect::from_min_max(
+                        Pos2::new(pin_pos.x - 20.0 * self.zoom, row_y - half_row),
+                        Pos2::new(pin_pos.x + in_reach, row_y + half_row),
+                    );
+                    in_pin_rects.push((node.id, in_port.id, pin_pos, hit_rect));
 
-                    let pin_hover = self.dragging_link.is_some()
+                    let pin_hover = self
+                        .dragging_link
+                        .is_some_and(|d| d.output_node_id != node.id)
                         && pointer_pos.is_some_and(|p| hit_rect.contains(p));
-                    let r = (PORT_PIN_RADIUS + if pin_hover { 1.8 } else { 0.0 }) * self.zoom;
+                    if pin_hover {
+                        let glow_rect = Rect::from_min_max(
+                            Pos2::new(rect.left() + 4.0 * self.zoom, row_y - half_row + 1.5),
+                            Pos2::new(
+                                pin_pos.x + in_reach - 6.0 * self.zoom,
+                                row_y + half_row - 1.5,
+                            ),
+                        );
+                        painter.rect_filled(
+                            glow_rect,
+                            CornerRadius::same(5),
+                            Color32::from_rgba_unmultiplied(10, 103, 229, 44),
+                        );
+                    }
+
+                    let r = (PORT_PIN_RADIUS + if pin_hover { 2.2 } else { 0.0 }) * self.zoom;
                     painter.circle_filled(pin_pos, r, theme::BG_OBSIDIAN);
-                    painter.circle_stroke(pin_pos, r, Stroke::new(1.9, theme::ACCENT_BLUE));
+                    painter.circle_stroke(
+                        pin_pos,
+                        r,
+                        Stroke::new(if pin_hover { 2.5 } else { 1.9 }, theme::ACCENT_BLUE),
+                    );
                     painter.text(
                         Pos2::new(pin_pos.x + 12.0 * self.zoom, row_y),
                         Align2::LEFT_CENTER,
                         truncate_label(&format_port_name(in_port), max_port_chars),
                         FontId::proportional((11.5 * self.zoom).clamp(8.0, 15.0)),
-                        theme::TEXT_MUTED,
+                        if pin_hover {
+                            theme::TEXT_PRIMARY
+                        } else {
+                            theme::TEXT_MUTED
+                        },
                     );
                 }
 
                 if let Some(out_port) = out_ports.get(row) {
                     let pin_pos = Pos2::new(rect.right(), row_y);
                     port_screen_pos.insert(out_port.id, pin_pos);
-                    let hit_rect = Rect::from_center_size(pin_pos, Vec2::splat(16.0 * self.zoom));
+                    let hit_rect = Rect::from_min_max(
+                        Pos2::new(pin_pos.x - out_reach, row_y - half_row),
+                        Pos2::new(pin_pos.x + 22.0 * self.zoom, row_y + half_row),
+                    );
                     out_pin_rects.push((node.id, out_port.id, hit_rect));
 
-                    let pin_hover = pointer_pos.is_some_and(|p| hit_rect.contains(p));
-                    let r = (PORT_PIN_RADIUS + if pin_hover { 1.4 } else { 0.0 }) * self.zoom;
+                    let pin_hover = self.dragging_link.is_none()
+                        && pointer_pos.is_some_and(|p| hit_rect.contains(p));
+                    if pin_hover {
+                        let glow_rect = Rect::from_min_max(
+                            Pos2::new(
+                                pin_pos.x - out_reach + 6.0 * self.zoom,
+                                row_y - half_row + 1.5,
+                            ),
+                            Pos2::new(rect.right() - 4.0 * self.zoom, row_y + half_row - 1.5),
+                        );
+                        painter.rect_filled(
+                            glow_rect,
+                            CornerRadius::same(5),
+                            Color32::from_rgba_unmultiplied(33, 222, 0, 32),
+                        );
+                    }
+
+                    let r = (PORT_PIN_RADIUS + if pin_hover { 2.0 } else { 0.0 }) * self.zoom;
                     painter.circle_filled(pin_pos, r, theme::BG_OBSIDIAN);
-                    painter.circle_stroke(pin_pos, r, Stroke::new(1.9, theme::ECONOMY_GREEN));
+                    painter.circle_stroke(
+                        pin_pos,
+                        r,
+                        Stroke::new(if pin_hover { 2.4 } else { 1.9 }, theme::ECONOMY_GREEN),
+                    );
                     painter.text(
                         Pos2::new(pin_pos.x - 12.0 * self.zoom, row_y),
                         Align2::RIGHT_CENTER,
                         truncate_label(&format_port_name(out_port), max_port_chars),
                         FontId::proportional((11.5 * self.zoom).clamp(8.0, 15.0)),
-                        theme::TEXT_MUTED,
+                        if pin_hover {
+                            theme::TEXT_PRIMARY
+                        } else {
+                            theme::TEXT_MUTED
+                        },
                     );
                 }
             }
         }
 
-        // Tahání nového kabelu z Output pinu (povoluje i více linek do stejného vstupního portu - fan-in mix!)
+        // Tahání nového kabelu z Output pinu (rozšířený hitbox pokrývá i popisek portu)
+        let mut hovering_pin = false;
         for &(out_node_id, out_port_id, hit_rect) in &out_pin_rects {
             let resp = ui.interact(
                 hit_rect,
                 ui.scope_id().with(("out_pin", out_port_id)),
                 Sense::click_and_drag(),
             );
+            if resp.hovered() || resp.dragged() {
+                hovering_pin = true;
+            }
             if resp.drag_started() {
                 self.dragging_link = Some(PendingDragLink {
                     output_node_id: out_node_id,
                     output_port_id: out_port_id,
                 });
             }
+        }
+
+        if self.dragging_link.is_some() || hovering_pin {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+        } else if dragging_any_node {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+        } else if hovering_any_node {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
         }
 
         // Vyhledání přesně jednoho nejbližšího kabelu pod kurzorem (i při více linkách do jednoho pinu)
@@ -539,7 +626,7 @@ impl PatchbayState {
                         *port_screen_pos.get(&link.input_port_id)?,
                     );
                     let dist = bezier_min_distance(p0, p3, ptr);
-                    (dist <= 9.5).then_some((link.id, dist))
+                    (dist <= 12.0).then_some((link.id, dist))
                 })
                 .min_by(|a, b| a.1.total_cmp(&b.1))
                 .map(|(id, _)| id)
@@ -591,25 +678,33 @@ impl PatchbayState {
         }
 
         if let Some(drag) = self.dragging_link {
-            if let (Some(&start), Some(cur)) =
-                (port_screen_pos.get(&drag.output_port_id), pointer_pos)
+            let snap_target = pointer_pos.and_then(|ptr| {
+                in_pin_rects
+                    .iter()
+                    .filter(|(in_node_id, _, _, hit)| {
+                        *in_node_id != drag.output_node_id && hit.contains(ptr)
+                    })
+                    .min_by(|(_, _, p_a, _), (_, _, p_b, _)| {
+                        p_a.distance_sq(ptr).total_cmp(&p_b.distance_sq(ptr))
+                    })
+                    .copied()
+            });
+
+            if let Some(&start) = port_screen_pos.get(&drag.output_port_id)
+                && let Some(end) = snap_target.map(|(_, _, p, _)| p).or(pointer_pos)
             {
-                draw_cable(&painter, start, cur, theme::BG_OBSIDIAN, 4.6);
-                draw_cable(&painter, start, cur, theme::ECONOMY_GREEN, 2.3);
+                draw_cable(&painter, start, end, theme::BG_OBSIDIAN, 4.6);
+                draw_cable(&painter, start, end, theme::ECONOMY_GREEN, 2.5);
             }
 
             if ui.input(|i| i.pointer.any_released()) {
-                if let Some(release_pos) = pointer_pos
-                    && let Some(&(in_node_id, in_port_id, _)) = in_pin_rects
-                        .iter()
-                        .find(|(_, _, r)| r.contains(release_pos))
-                    && in_node_id != drag.output_node_id
-                {
+                if let Some((in_node_id, in_port_id, _, _)) = snap_target {
                     client.send_command(IpcRequest::CreateLink {
                         output_node_id: drag.output_node_id,
                         output_port_id: drag.output_port_id,
                         input_node_id: in_node_id,
                         input_port_id: in_port_id,
+                        replace_input: true,
                     });
                 }
                 self.dragging_link = None;
@@ -826,7 +921,7 @@ impl PatchbayState {
             ui.add_space(10.0);
             ui.label(
                 egui::RichText::new(
-                    "Tip: Můžeš připojit i více zelených výstupů do jednoho modrého vstupu (např. L+R do jednoho kanálu) – PipeWire zvuk automaticky smíchá. Pravým kliknutím na drát spojení zrušíš.",
+                    "Tip: Přetažením na modrý vstupní pin se původní drát na tomto vstupu automaticky odpojí a nahradí novým. Pravým kliknutím na drát spojení zrušíš.",
                 )
                 .color(theme::TEXT_SUBTLE)
                 .size(11.5),
@@ -845,6 +940,7 @@ fn connect_stereo_ports(src: &NodeSnapshot, dst: &NodeSnapshot, client: &CrimpCl
             output_port_id: outs[i].id,
             input_node_id: dst.id,
             input_port_id: ins[i].id,
+            replace_input: true,
         });
     }
 }

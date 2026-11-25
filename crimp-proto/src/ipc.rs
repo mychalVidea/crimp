@@ -72,11 +72,17 @@ pub enum IpcRequest {
         output_port_id: u32,
         input_node_id: u32,
         input_port_id: u32,
+        #[serde(default = "default_true")]
+        replace_input: bool,
     },
     DestroyLink {
         link_id: u32,
     },
     Shutdown,
+}
+
+const fn default_true() -> bool {
+    true
 }
 
 /// Souhrnný stav běžícího daemona.

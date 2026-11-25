@@ -1,74 +1,17 @@
+use crimp_proto::ipc::{IpcRequest, resolve_socket_path, send_request};
 use ksni::blocking::TrayMethods;
 use ksni::{Icon, MenuItem, ToolTip};
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::process::Command;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TrayCommand {
-    ShowWindow,
-    HideWindow,
-    ToggleWindow,
-    ReloadRules,
-    QuitApp,
-}
-
-pub struct TrayController {
-    rx: Receiver<TrayCommand>,
-    _tray_handle: Option<ksni::blocking::Handle<CrimpTray>>,
-    ui_sock_path: PathBuf,
-}
-
-impl TrayController {
-    #[must_use]
-    pub fn spawn(ctx: egui::Context) -> Self {
-        let (tx, rx) = mpsc::channel::<TrayCommand>();
-        let ui_sock_path = ui_socket_path();
-
-        spawn_ui_wake_listener(ui_sock_path.clone(), tx.clone(), ctx.clone());
-
-        let tray = CrimpTray {
-            tx,
-            ctx,
-            icon: render_tray_icon_argb32(),
-        };
-        let tray_handle = tray.assume_sni_available(true).spawn().ok();
-
-        Self {
-            rx,
-            _tray_handle: tray_handle,
-            ui_sock_path,
-        }
-    }
-
-    pub fn try_recv(&self) -> Option<TrayCommand> {
-        self.rx.try_recv().ok()
-    }
-}
-
-impl Drop for TrayController {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.ui_sock_path);
-    }
-}
-
-/// Zjistí, zda už běží instance `crimp-ui` (např. minimalizovaná v trayi).
-/// Pokud ano, požádá ji o zobrazení okna a vrátí `true`.
-#[must_use]
-pub fn try_focus_existing_instance() -> bool {
-    let sock = ui_socket_path();
-    let Ok(mut stream) = UnixStream::connect(&sock) else {
-        return false;
-    };
-    let _ = stream.set_write_timeout(Some(Duration::from_secs(1)));
-    stream.write_all(b"show\n").is_ok()
-}
-
-fn ui_socket_path() -> PathBuf {
+fn ui_window_socket_path() -> PathBuf {
     if let Some(runtime) = dirs::runtime_dir() {
         return runtime.join("crimp-ui.sock");
     }
@@ -76,59 +19,164 @@ fn ui_socket_path() -> PathBuf {
     std::env::temp_dir().join(format!("crimp-ui-{user}.sock"))
 }
 
-fn spawn_ui_wake_listener(sock_path: PathBuf, tx: Sender<TrayCommand>, ctx: egui::Context) {
-    if sock_path.exists() {
-        let _ = fs::remove_file(&sock_path);
+fn tray_socket_path() -> PathBuf {
+    if let Some(runtime) = dirs::runtime_dir() {
+        return runtime.join("crimp-tray.sock");
     }
+    let user = std::env::var("USER").unwrap_or_else(|_| "default".into());
+    std::env::temp_dir().join(format!("crimp-tray-{user}.sock"))
+}
+
+fn send_line(sock: &PathBuf, msg: &str) -> bool {
+    let Ok(mut stream) = UnixStream::connect(sock) else {
+        return false;
+    };
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(1)));
+    stream.write_all(format!("{msg}\n").as_bytes()).is_ok()
+}
+
+/// Zkusí zaměřit již otevřené okno `crimp-ui`.
+#[must_use]
+pub fn try_focus_existing_window() -> bool {
+    send_line(&ui_window_socket_path(), "show")
+}
+
+/// Spustí na pozadí lehký tray proces (`crimp-ui --tray`), pokud ještě neběží.
+pub fn ensure_tray_running() {
+    if send_line(&tray_socket_path(), "ping") {
+        return;
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        let _ = Command::new(exe).arg("--tray").spawn();
+    }
+}
+
+/// Restartuje běžící tray proces (např. po auto-updatu na novou binárku).
+pub fn restart_tray_if_running() {
+    if send_line(&tray_socket_path(), "quit") {
+        thread::sleep(Duration::from_millis(120));
+        if let Ok(exe) = std::env::current_exe() {
+            let _ = Command::new(exe).arg("--tray").spawn();
+        }
+    }
+}
+
+/// Odstraní socket okna při ukončování/restartu.
+pub fn cleanup_window_socket() {
+    let _ = fs::remove_file(ui_window_socket_path());
+}
+
+/// Spustí posluchač okna pro příkazy `show` (zaměření) a `quit` (ukončení z tray menu).
+pub struct WindowWakeGuard {
+    sock_path: PathBuf,
+}
+
+impl Drop for WindowWakeGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.sock_path);
+    }
+}
+
+#[must_use]
+pub fn spawn_window_wake_listener(
+    ctx: egui::Context,
+    quit_requested: Arc<AtomicBool>,
+) -> WindowWakeGuard {
+    let sock_path = ui_window_socket_path();
+    let _ = fs::remove_file(&sock_path);
     if let Some(parent) = sock_path.parent() {
         let _ = fs::create_dir_all(parent);
     }
-    let Ok(listener) = UnixListener::bind(&sock_path) else {
-        return;
-    };
-
-    let _ = thread::Builder::new()
-        .name("crimp-ui-wake".into())
-        .spawn(move || {
-            for stream in listener.incoming().flatten() {
-                let mut reader = BufReader::new(stream);
-                let mut line = String::new();
-                if reader.read_line(&mut line).is_ok() && line.trim() == "show" {
-                    let _ = tx.send(TrayCommand::ShowWindow);
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-                    ctx.request_repaint();
+    if let Ok(listener) = UnixListener::bind(&sock_path) {
+        let _ = thread::Builder::new()
+            .name("crimp-ui-wake".into())
+            .spawn(move || {
+                for stream in listener.incoming().flatten() {
+                    let mut reader = BufReader::new(stream);
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).is_ok() {
+                        match line.trim() {
+                            "show" => {
+                                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                                ctx.request_repaint();
+                            }
+                            "quit" => {
+                                quit_requested.store(true, Ordering::SeqCst);
+                                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                                ctx.request_repaint();
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
                 }
+            });
+    }
+    WindowWakeGuard { sock_path }
+}
+
+/// Samostatná lehká tray smyčka (`crimp-ui --tray`), bez OpenGL okna a bez Wayland `set_visible` bugu.
+pub fn run_tray_service_blocking() {
+    let sock_path = tray_socket_path();
+    if send_line(&sock_path, "ping") {
+        // Tray už běží.
+        return;
+    }
+    let _ = fs::remove_file(&sock_path);
+    if let Some(parent) = sock_path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+
+    let running = Arc::new(AtomicBool::new(true));
+    let tray = CrimpTray {
+        running: Arc::clone(&running),
+        tray_sock: sock_path.clone(),
+        icon: render_tray_icon_argb32(),
+    };
+    let _handle = tray.assume_sni_available(true).spawn();
+
+    if let Ok(listener) = UnixListener::bind(&sock_path) {
+        let _ = listener.set_nonblocking(true);
+        while running.load(Ordering::SeqCst) {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    let mut reader = BufReader::new(stream);
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).is_ok() && line.trim() == "quit" {
+                        let _ = send_line(&ui_window_socket_path(), "quit");
+                        running.store(false, Ordering::SeqCst);
+                        break;
+                    }
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(150));
+                }
+                Err(_) => break,
             }
-        });
+        }
+    } else {
+        while running.load(Ordering::SeqCst) {
+            thread::sleep(Duration::from_millis(250));
+        }
+    }
+
+    let _ = fs::remove_file(&sock_path);
+}
+
+fn open_or_focus_window() {
+    if try_focus_existing_window() {
+        return;
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        let _ = Command::new(exe).arg("--window").spawn();
+    }
 }
 
 struct CrimpTray {
-    tx: Sender<TrayCommand>,
-    ctx: egui::Context,
+    running: Arc<AtomicBool>,
+    tray_sock: PathBuf,
     icon: Vec<Icon>,
-}
-
-impl CrimpTray {
-    fn emit(&self, cmd: TrayCommand) {
-        let _ = self.tx.send(cmd);
-        match cmd {
-            TrayCommand::ShowWindow => {
-                self.ctx
-                    .send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                self.ctx
-                    .send_viewport_cmd(egui::ViewportCommand::Minimized(false));
-                self.ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-            }
-            TrayCommand::HideWindow => {
-                self.ctx
-                    .send_viewport_cmd(egui::ViewportCommand::Visible(false));
-            }
-            TrayCommand::ToggleWindow | TrayCommand::QuitApp | TrayCommand::ReloadRules => {}
-        }
-        self.ctx.request_repaint();
-    }
 }
 
 impl ksni::Tray for CrimpTray {
@@ -151,41 +199,50 @@ impl ksni::Tray for CrimpTray {
     fn tool_tip(&self) -> ToolTip {
         ToolTip {
             title: "Crimp Audio Patchbay".into(),
-            description: "Kliknutím otevřeš nebo skryješ okno".into(),
+            description: "Kliknutím otevřeš Patchbay & PipeWire nastavení".into(),
             ..Default::default()
         }
     }
 
     fn activate(&mut self, _x: i32, _y: i32) {
-        self.emit(TrayCommand::ToggleWindow);
+        open_or_focus_window();
     }
 
     fn menu(&self) -> Vec<MenuItem<Self>> {
         use ksni::menu::StandardItem;
         vec![
             StandardItem {
-                label: "Otevřít Patchbay".into(),
-                activate: Box::new(|this: &mut Self| this.emit(TrayCommand::ShowWindow)),
+                label: "Otevřít Crimp".into(),
+                activate: Box::new(|_this: &mut Self| open_or_focus_window()),
                 ..Default::default()
             }
             .into(),
             StandardItem {
-                label: "Skrýt do lišty".into(),
-                activate: Box::new(|this: &mut Self| this.emit(TrayCommand::HideWindow)),
+                label: "Skrýt okno do lišty".into(),
+                activate: Box::new(|_this: &mut Self| {
+                    let _ = send_line(&ui_window_socket_path(), "quit");
+                }),
                 ..Default::default()
             }
             .into(),
             MenuItem::Separator,
             StandardItem {
                 label: "Načíst pravidla (rules.toml)".into(),
-                activate: Box::new(|this: &mut Self| this.emit(TrayCommand::ReloadRules)),
+                activate: Box::new(|_this: &mut Self| {
+                    let sock = resolve_socket_path(None);
+                    let _ = send_request(&sock, &IpcRequest::Reload);
+                }),
                 ..Default::default()
             }
             .into(),
             MenuItem::Separator,
             StandardItem {
                 label: "Ukončit Crimp UI".into(),
-                activate: Box::new(|this: &mut Self| this.emit(TrayCommand::QuitApp)),
+                activate: Box::new(|this: &mut Self| {
+                    let _ = send_line(&ui_window_socket_path(), "quit");
+                    this.running.store(false, Ordering::SeqCst);
+                    let _ = UnixStream::connect(&this.tray_sock);
+                }),
                 ..Default::default()
             }
             .into(),
@@ -214,7 +271,6 @@ fn render_tray_icon_argb32() -> Vec<Icon> {
             let nx = x as f32 / 31.0;
             let ny = y as f32 / 31.0;
 
-            // Dvě protínající se S-křivky (modrá & zelená) + tečky na krajích
             let t = ((nx - 0.25) / 0.5).clamp(0.0, 1.0);
             let s = t * t * (3.0 - 2.0 * t);
             let blue_y = 0.32 + 0.36 * s;
