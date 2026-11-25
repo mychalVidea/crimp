@@ -1,0 +1,15 @@
+[package]
+name = "crimp-proto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Sdílená jádrová logika, konfigurační schéma, PipeWire graf a IPC protokol pro Crimp."
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+dirs = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }

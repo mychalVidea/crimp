@@ -1,0 +1,18 @@
+[Unit]
+Description=Crimp – PipeWire Routing, Virtual Sink & Blocklist Daemon
+Documentation=https://github.com/mychalVidea/crimp
+After=pipewire.socket pipewire.service wireplumber.service
+Wants=pipewire.socket
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/crimp daemon
+ExecReload=%h/.local/bin/crimp reload
+Restart=on-failure
+RestartSec=2
+KillSignal=SIGTERM
+TimeoutStopSec=5
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=default.target

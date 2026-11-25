@@ -1,0 +1,13 @@
+[package]
+name = "crimp-ui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Ultralehký grafický PipeWire Patchbay & Settings inspektor pro Crimp (alternativa ke qpwgraph)."
+
+[dependencies]
+crimp-proto = { workspace = true }
+eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts", "wayland", "x11"] }
+egui = { version = "0.37", default-features = false, features = ["default_fonts"] }
+serde_json = { workspace = true }

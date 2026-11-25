@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Crimp
+GenericName=PipeWire Patchbay & Router
+Comment=Ultralehký PipeWire Patchbay, routovací pravidla a živé DSP nastavení
+Exec=crimp-ui
+Icon=crimp
+Terminal=false
+Categories=AudioVideo;Audio;Mixer;Settings;
+Keywords=pipewire;audio;patchbay;routing;wireplumber;qpwgraph;
+StartupNotify=true
+StartupWMClass=crimp

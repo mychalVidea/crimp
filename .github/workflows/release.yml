@@ -1,0 +1,90 @@
+name: Release Crimp Packages
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-linux:
+    name: Build Linux Package (${{ matrix.target }})
+    runs-on: ubuntu-22.04
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            deb_arch: amd64
+            target: x86_64-unknown-linux-gnu
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install PipeWire & build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libpipewire-0.3-dev libspa-0.2-dev clang pkg-config dpkg-dev
+
+      - name: Install Rust 1.100+ toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run core tests & build workspace release binaries
+        run: |
+          cargo test --workspace --locked
+          cargo build --release --workspace --locked
+
+      - name: Package .tar.gz bundle (crimp + crimp-ui + desktop)
+        run: |
+          STAGE="crimp-linux-${{ matrix.arch }}"
+          mkdir -p "$STAGE/contrib"
+          install -Dm755 target/release/crimp "$STAGE/crimp"
+          install -Dm755 target/release/crimp-ui "$STAGE/crimp-ui"
+          install -Dm644 crimp.svg "$STAGE/crimp.svg"
+          install -Dm644 contrib/crimp.desktop "$STAGE/contrib/crimp.desktop"
+          install -Dm644 contrib/crimp.service "$STAGE/contrib/crimp.service"
+          install -Dm644 README.md "$STAGE/README.md"
+          install -Dm644 LICENSE "$STAGE/LICENSE"
+          tar -czf "${STAGE}.tar.gz" "$STAGE"
+          sha256sum "${STAGE}.tar.gz" > "${STAGE}.tar.gz.sha256"
+
+      - name: Build .deb package
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          if [ "${GITHUB_REF_NAME}" = "${GITHUB_REF#refs/heads/}" ] || [ -z "$VERSION" ]; then
+            VERSION="0.2.0"
+          fi
+          DEB_DIR="crimp_${VERSION}_${{ matrix.deb_arch }}"
+          mkdir -p "${DEB_DIR}/DEBIAN" \
+                   "${DEB_DIR}/usr/bin" \
+                   "${DEB_DIR}/usr/share/applications" \
+                   "${DEB_DIR}/usr/share/icons/hicolor/scalable/apps" \
+                   "${DEB_DIR}/usr/lib/systemd/user"
+          install -Dm755 target/release/crimp "${DEB_DIR}/usr/bin/crimp"
+          install -Dm755 target/release/crimp-ui "${DEB_DIR}/usr/bin/crimp-ui"
+          install -Dm644 contrib/crimp.desktop "${DEB_DIR}/usr/share/applications/crimp.desktop"
+          install -Dm644 crimp.svg "${DEB_DIR}/usr/share/icons/hicolor/scalable/apps/crimp.svg"
+          install -Dm644 contrib/crimp.service "${DEB_DIR}/usr/lib/systemd/user/crimp.service"
+          printf '%s\n' \
+            "Package: crimp" \
+            "Version: ${VERSION}" \
+            "Section: sound" \
+            "Priority: optional" \
+            "Architecture: ${{ matrix.deb_arch }}" \
+            "Depends: libpipewire-0.3-0" \
+            "Maintainer: mychalVidea <https://github.com/mychalVidea/crimp>" \
+            "Description: Lightweight PipeWire Patchbay GUI, router & blocklist daemon" \
+            > "${DEB_DIR}/DEBIAN/control"
+          dpkg-deb --build "${DEB_DIR}"
+
+      - name: Upload GitHub Release assets
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/v')
+        with:
+          files: |
+            crimp-linux-${{ matrix.arch }}.tar.gz
+            crimp-linux-${{ matrix.arch }}.tar.gz.sha256
+            crimp_*.deb

@@ -1,0 +1,34 @@
+# Maintainer: mychalVidea <https://github.com/mychalVidea/crimp>
+pkgname=crimp
+pkgver=0.2.0
+pkgrel=1
+pkgdesc="Ultralehký PipeWire Patchbay GUI, routing daemon a live DSP manažer pro Linux"
+arch=('x86_64' 'aarch64')
+url="https://github.com/mychalVidea/crimp"
+license=('MIT')
+depends=('pipewire')
+makedepends=('rust' 'cargo' 'clang' 'pkgconf')
+optdepends=('wireplumber: výchozí session manager PipeWire')
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+build() {
+    cd "$pkgname-$pkgver"
+    export RUSTUP_TOOLCHAIN=stable
+    cargo build --release --workspace --locked
+}
+
+check() {
+    cd "$pkgname-$pkgver"
+    cargo test -p crimp-proto --locked
+}
+
+package() {
+    cd "$pkgname-$pkgver"
+    install -Dm755 "target/release/crimp" "$pkgdir/usr/bin/crimp"
+    install -Dm755 "target/release/crimp-ui" "$pkgdir/usr/bin/crimp-ui"
+    install -Dm644 "contrib/crimp.desktop" "$pkgdir/usr/share/applications/crimp.desktop"
+    install -Dm644 "crimp.svg" "$pkgdir/usr/share/icons/hicolor/scalable/apps/crimp.svg"
+    install -Dm644 "contrib/crimp.service" "$pkgdir/usr/lib/systemd/user/crimp.service"
+    install -Dm644 "LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}
