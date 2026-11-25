@@ -21,7 +21,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc;
+use std::sync::{Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
@@ -93,7 +93,7 @@ pub enum PwCommand {
 pub struct PwHandle {
     sender: pw::channel::Sender<PwCommand>,
     shutdown_flag: Arc<AtomicBool>,
-    join_handle: Option<JoinHandle<Result<(), PwError>>>,
+    join_handle: Mutex<Option<JoinHandle<Result<(), PwError>>>>,
 }
 
 impl PwHandle {
@@ -233,8 +233,14 @@ impl PwHandle {
         let _ = self.sender.send(PwCommand::Shutdown);
     }
 
-    pub fn join(mut self) -> Result<(), PwError> {
-        if let Some(handle) = self.join_handle.take() {
+    pub fn join(&self) -> Result<(), PwError> {
+        let handle = self
+            .join_handle
+            .lock()
+            .ok()
+            .and_then(|mut guard| guard.take());
+
+        if let Some(handle) = handle {
             match handle.join() {
                 Ok(res) => res,
                 Err(_) => {
@@ -272,7 +278,7 @@ pub fn spawn_pw_thread(
     Ok(PwHandle {
         sender,
         shutdown_flag,
-        join_handle: Some(join_handle),
+        join_handle: Mutex::new(Some(join_handle)),
     })
 }
 

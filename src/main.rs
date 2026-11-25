@@ -467,23 +467,10 @@ fn run_daemon(custom_config: Option<PathBuf>, custom_socket: Option<String>) -> 
         error!(error = %err, "Nelze zaregistrovat signal handler");
     }
 
-    let pw_owned = match Arc::try_unwrap(pw_handle) {
-        Ok(handle) => handle,
-        Err(shared) => {
-            drop(ipc_handle);
-            match Arc::try_unwrap(shared) {
-                Ok(handle) => handle,
-                Err(_) => {
-                    warn!("Sdílená reference na PwHandle při vypnutí zůstala v signal handleru");
-                    return ExitCode::SUCCESS;
-                }
-            }
-        }
-    };
-
+    let join_result = pw_handle.join();
     drop(ipc_handle);
 
-    match pw_owned.join() {
+    match join_result {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             error!(error = %err, "Crimp skončil s chybou");
