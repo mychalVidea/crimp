@@ -1,8 +1,10 @@
 mod client;
+mod layout_store;
 mod patchbay;
 mod rules_view;
 mod settings_view;
 mod theme;
+mod tray;
 
 use client::{ActionFeedback, CrimpClient};
 use crimp_proto::ipc::IpcRequest;
@@ -10,6 +12,7 @@ use egui::{CornerRadius, Stroke};
 use patchbay::PatchbayState;
 use rules_view::RulesViewState;
 use settings_view::SettingsViewState;
+use tray::{TrayCommand, TrayController};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ActiveTab {
@@ -20,6 +23,9 @@ enum ActiveTab {
 
 struct CrimpGuiApp {
     client: CrimpClient,
+    tray: TrayController,
+    window_visible: bool,
+    force_quit: bool,
     tab: ActiveTab,
     patchbay: PatchbayState,
     settings: SettingsViewState,
@@ -31,8 +37,12 @@ impl CrimpGuiApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         theme::apply_obsidian_style(&cc.egui_ctx);
         let client = CrimpClient::spawn(cc.egui_ctx.clone());
+        let tray = TrayController::spawn(cc.egui_ctx.clone());
         Self {
             client,
+            tray,
+            window_visible: true,
+            force_quit: false,
             tab: ActiveTab::Patchbay,
             patchbay: PatchbayState::default(),
             settings: SettingsViewState::default(),
@@ -40,15 +50,57 @@ impl CrimpGuiApp {
             last_feedback: None,
         }
     }
+
+    fn show_window(&mut self, ctx: &egui::Context) {
+        self.window_visible = true;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+    }
+
+    fn hide_to_tray(&mut self, ctx: &egui::Context, snap: &client::UiSnapshot) {
+        self.patchbay.flush_saved_layout(snap.graph.as_ref());
+        self.window_visible = false;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+    }
 }
 
 impl eframe::App for CrimpGuiApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let snap = self.client.snapshot();
+
+        while let Some(cmd) = self.tray.try_recv() {
+            match cmd {
+                TrayCommand::ShowWindow => self.show_window(ui.ctx()),
+                TrayCommand::HideWindow => self.hide_to_tray(ui.ctx(), &snap),
+                TrayCommand::ToggleWindow => {
+                    if self.window_visible {
+                        self.hide_to_tray(ui.ctx(), &snap);
+                    } else {
+                        self.show_window(ui.ctx());
+                    }
+                }
+                TrayCommand::ReloadRules => {
+                    self.client.send_command(IpcRequest::Reload);
+                }
+                TrayCommand::QuitApp => {
+                    self.patchbay.flush_saved_layout(snap.graph.as_ref());
+                    self.force_quit = true;
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
+        }
+
+        // Zavření okna křížkem minimalizuje okno do system traye (pokud nekliknuto Ukončit v tray menu)
+        if !self.force_quit && ui.ctx().input(|i| i.viewport().close_requested()) {
+            ui.ctx()
+                .send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.hide_to_tray(ui.ctx(), &snap);
+        }
+
         if let Some(fb) = self.client.drain_feedback() {
             self.last_feedback = Some(fb);
         }
-
-        let snap = self.client.snapshot();
 
         egui::Panel::top("crimp_top_bar")
             .frame(
@@ -93,12 +145,9 @@ impl eframe::App for CrimpGuiApp {
                                 .size(12.5),
                         );
                         ui.label(
-                            egui::RichText::new(format!(
-                                "({})",
-                                self.client.socket_path().display()
-                            ))
-                            .size(11.0)
-                            .color(theme::TEXT_SUBTLE),
+                            egui::RichText::new(format!("({})", self.client.socket_path().display()))
+                                .size(11.0)
+                                .color(theme::TEXT_SUBTLE),
                         );
                         if ui.button("Spustit daemon").clicked() {
                             match self.client.spawn_background_daemon() {
@@ -134,12 +183,20 @@ impl eframe::App for CrimpGuiApp {
                                 egui::RichText::new(format!("{q} @ {r} Hz  ·  {ms:.2} ms"))
                                     .color(theme::TEXT_PRIMARY)
                                     .size(12.5),
-                            );
+                            )
+                            .on_hover_text("Aktuální PipeWire buffer (vzorky), sample rate a výsledná latence");
                         }
                     }
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        // Akce & Auto-update napravo
+                        if ui
+                            .button("Do lišty")
+                            .on_hover_text("Skryje okno do oznamovací oblasti (system tray), daemon běží dál")
+                            .clicked()
+                        {
+                            self.hide_to_tray(ui.ctx(), &snap);
+                        }
+
                         if snap.restart_ready {
                             if ui
                                 .add(
@@ -148,9 +205,12 @@ impl eframe::App for CrimpGuiApp {
                                         .corner_radius(CornerRadius::same(7)),
                                 )
                                 .clicked()
-                                && self.client.restart_gui_process().is_ok()
                             {
-                                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                                self.patchbay.flush_saved_layout(snap.graph.as_ref());
+                                if self.client.restart_gui_process().is_ok() {
+                                    self.force_quit = true;
+                                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                                }
                             }
                         } else if snap.update_in_progress {
                             ui.label(
@@ -175,9 +235,11 @@ impl eframe::App for CrimpGuiApp {
                                 self.client.trigger_self_update();
                             }
                         } else {
-                            let update_resp = ui.button("Update").on_hover_text(
-                                "Kliknutím zkontroluje / aktualizuje Crimp z GitHubu",
-                            );
+                            let update_resp = ui
+                                .button("Update")
+                                .on_hover_text(
+                                    "Levý klik: stáhne a nainstaluje nejnovější Crimp z GitHubu.\nPravý klik: jen ověří, zda vyšla novější verze.",
+                                );
                             if update_resp.clicked() {
                                 self.client.trigger_self_update();
                             }
@@ -186,15 +248,15 @@ impl eframe::App for CrimpGuiApp {
                             }
                         }
 
-                        if ui.button("Reload").clicked() {
+                        if ui
+                            .button("Načíst pravidla")
+                            .on_hover_text("Okamžitě znovu načte ~/.config/crimp/rules.toml v běžícím daemonu")
+                            .clicked()
+                        {
                             self.client.send_command(IpcRequest::Reload);
-                        }
-                        if ui.button("Obnovit").clicked() {
-                            self.client.refresh_now();
                         }
                         theme::spec_divider(ui);
 
-                        // Segmentový přepínač záložek
                         for (tab, label) in [
                             (ActiveTab::Rules, "Pravidla & Blocklist"),
                             (ActiveTab::Settings, "PipeWire Settings"),
@@ -276,14 +338,24 @@ impl eframe::App for CrimpGuiApp {
                 }
             });
     }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        let snap = self.client.snapshot();
+        self.patchbay.flush_saved_layout(snap.graph.as_ref());
+    }
 }
 
 fn main() -> eframe::Result<()> {
+    // Pokud už okno Crimpu běží v system trayi, jen ho vytáhneme do popředí místo duplicitní instance.
+    if tray::try_focus_existing_instance() {
+        return Ok(());
+    }
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_app_id("crimp")
             .with_inner_size([1240.0, 760.0])
-            .with_min_inner_size([840.0, 520.0])
+            .with_min_inner_size([860.0, 520.0])
             .with_title("Crimp – PipeWire Patchbay & Settings"),
         ..Default::default()
     };

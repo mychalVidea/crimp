@@ -1168,10 +1168,11 @@ impl DaemonState {
 
     fn snapshot(&self) -> GraphSnapshot {
         let virtual_names: HashSet<String> = self.virtual_sinks.keys().cloned().collect();
-        self.graph
-            .snapshot_with_annotations(&virtual_names, |resolved| {
-                self.engine.matching_route_for_link(resolved)
-            })
+        self.graph.snapshot_with_annotations(
+            &virtual_names,
+            |resolved| self.engine.matching_route_for_link(resolved),
+            |node| self.engine.resolve_alias(node),
+        )
     }
 
     fn status(&self) -> DaemonStatus {

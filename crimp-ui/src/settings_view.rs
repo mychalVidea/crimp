@@ -60,6 +60,9 @@ impl SettingsViewState {
                                     .size(22.0)
                                     .color(theme::ECONOMY_GREEN)
                                     .strong(),
+                            )
+                            .on_hover_text(
+                                "Zpoždění zpracování zvuku v jednom bufferu (quantum / frekvence). Do ~5 ms vhodné pro hry a DAW, 10–21 ms je úsporné pro filmy a běžný poslech.",
                             );
                             ui.label(
                                 egui::RichText::new(format!(
@@ -78,8 +81,14 @@ impl SettingsViewState {
                                 ui,
                                 "PipeWire Verze",
                                 rt.core_version.as_deref().unwrap_or("-"),
+                                "Verze běžícího PipeWire audio serveru v systému.",
                             );
-                            kv(ui, "Core", rt.core_name.as_deref().unwrap_or("-"));
+                            kv(
+                                ui,
+                                "Core",
+                                rt.core_name.as_deref().unwrap_or("-"),
+                                "Název hlavní instance PipeWire serveru.",
+                            );
                             ui.end_row();
                             kv(
                                 ui,
@@ -88,6 +97,7 @@ impl SettingsViewState {
                                     .as_deref()
                                     .or(rt.clock_quantum.as_deref())
                                     .unwrap_or("-"),
+                                "Počet zvukových vzorků zpracovaných najednou. Menší = rychlejší odezva, větší = stabilnější při zátěži CPU.",
                             );
                             kv(
                                 ui,
@@ -96,6 +106,7 @@ impl SettingsViewState {
                                     .as_deref()
                                     .or(rt.clock_rate.as_deref())
                                     .unwrap_or("-"),
+                                "Vzorkovací frekvence grafu v Hz (48000 Hz je standard pro hry a videa, 96000 Hz pro studio/Hi-Res).",
                             );
                             ui.end_row();
                             kv(
@@ -104,11 +115,13 @@ impl SettingsViewState {
                                 status
                                     .and_then(|s| s.dsp_active_profile.as_deref())
                                     .unwrap_or("výchozí / auto"),
+                                "Automatický DSP profil podle spuštěné aplikace (nebo ruční přepínač níže).",
                             );
                             kv(
                                 ui,
                                 "Výchozí Sink",
                                 rt.default_audio_sink.as_deref().unwrap_or("-"),
+                                "Výchozí výstupní zařízení (sluchátka/repro), kam míří nově spuštěné aplikace.",
                             );
                             ui.end_row();
                         });
@@ -125,12 +138,33 @@ impl SettingsViewState {
             // 2. Okamžité přepínání DSP (clock.force-quantum & clock.force-rate)
             theme::card_frame().show(ui, |ui| {
                 theme::section_label(ui, "Živé DSP přepínače (Buffer / Sample Rate)");
+                ui.label(
+                    egui::RichText::new(
+                        "Najeď myší na libovolný název pro vysvětlení. Změny se projeví okamžitě bez restartu her ani programů.",
+                    )
+                    .size(11.5)
+                    .color(theme::TEXT_MUTED),
+                );
                 ui.add_space(6.0);
                 ui.horizontal_wrapped(|ui| {
-                    ui.label(egui::RichText::new("Quantum:").color(theme::TEXT_MUTED));
-                    for q in [64u32, 128, 256, 512, 1024, 2048] {
+                    ui.label(egui::RichText::new("Quantum (Buffer):").color(theme::TEXT_MUTED))
+                        .on_hover_text(
+                            "64–128 = nízká latence pro DAW a kompetitivní hry.\n256–512 = ideální zlatý střed.\n1024–2048 = minimální spotřeba CPU, nulové praskání.\nAuto = nechá PipeWire rozhodovat samo.",
+                        );
+                    for (q, hint) in [
+                        (64u32, "Ultra nízká latence (~1.3 ms @ 48k)"),
+                        (128, "Studio / nízká latence (~2.7 ms @ 48k)"),
+                        (256, "Hraní / vyvážená latence (~5.3 ms @ 48k)"),
+                        (512, "Běžné použití (~10.7 ms @ 48k)"),
+                        (1024, "Úsporný buffer (~21.3 ms @ 48k)"),
+                        (2048, "Maximální stabilita při extrémní zátěži"),
+                    ] {
                         let active = status.and_then(|s| s.manual_quantum_override) == Some(q);
-                        if ui.selectable_label(active, format!("{q}")).clicked() {
+                        if ui
+                            .selectable_label(active, format!("{q}"))
+                            .on_hover_text(hint)
+                            .clicked()
+                        {
                             client.send_command(IpcRequest::SetDsp {
                                 quantum: DspOverrideChange::Set(q),
                                 rate: DspOverrideChange::Keep,
@@ -142,6 +176,7 @@ impl SettingsViewState {
                             status.is_some_and(|s| s.manual_quantum_override.is_none()),
                             "Auto",
                         )
+                        .on_hover_text("Vrátí řízení velikosti bufferu zpět PipeWire/aplikacím")
                         .clicked()
                     {
                         client.send_command(IpcRequest::SetDsp {
@@ -153,7 +188,10 @@ impl SettingsViewState {
 
                 ui.add_space(4.0);
                 ui.horizontal_wrapped(|ui| {
-                    ui.label(egui::RichText::new("Sample Rate:").color(theme::TEXT_MUTED));
+                    ui.label(egui::RichText::new("Sample Rate:").color(theme::TEXT_MUTED))
+                        .on_hover_text(
+                            "48000 Hz je výchozí standard pro Windows, Linux, hry i video.\n44100 Hz používají hudební CD/Spotify.\n96000+ Hz má smysl hlavně pro DACy a hudební produkci.",
+                        );
                     for r in [44100u32, 48000, 88200, 96000, 192000] {
                         let active = status.and_then(|s| s.manual_rate_override) == Some(r);
                         if ui.selectable_label(active, format!("{r} Hz")).clicked() {
@@ -168,6 +206,7 @@ impl SettingsViewState {
                             status.is_some_and(|s| s.manual_rate_override.is_none()),
                             "Auto",
                         )
+                        .on_hover_text("Nechá PipeWire vybrat frekvenci automaticky podle zdroje zvuku")
                         .clicked()
                     {
                         client.send_command(IpcRequest::SetDsp {
@@ -193,6 +232,7 @@ impl SettingsViewState {
                             "clock.min-quantum",
                             &mut self.min_quantum_input,
                             "32",
+                            "Nejnižší buffer, jaký si jakákoliv aplikace smí vyžádat. Pokud ti v hrách praská zvuk, nastav např. 128 nebo 256.",
                             MetadataTarget::Settings,
                             client,
                         );
@@ -201,6 +241,7 @@ impl SettingsViewState {
                             "clock.max-quantum",
                             &mut self.max_quantum_input,
                             "2048",
+                            "Nejvyšší buffer, na jaký smí PipeWire povyrůst při úspoře energie.",
                             MetadataTarget::Settings,
                             client,
                         );
@@ -209,6 +250,7 @@ impl SettingsViewState {
                             "clock.quantum-limit",
                             &mut self.quantum_limit_input,
                             "8192",
+                            "Tvrdý bezpečnostní strop velikosti bufferu v PipeWire.",
                             MetadataTarget::Settings,
                             client,
                         );
@@ -217,6 +259,7 @@ impl SettingsViewState {
                             "clock.allowed-rates",
                             &mut self.allowed_rates_input,
                             "[ 44100 48000 96000 ]",
+                            "Povolené vzorkovací frekvence v hranatých závorkách. Např. [ 48000 ] zamezí přepínání frekvencí při hraní/hudbě.",
                             MetadataTarget::Settings,
                             client,
                         );
@@ -230,6 +273,9 @@ impl SettingsViewState {
                     ui.label(
                         egui::RichText::new(format!("clock.power-of-two-quantum: {pow2}"))
                             .color(theme::TEXT_MUTED),
+                    )
+                    .on_hover_text(
+                        "Pokud je true, velikost bufferu musí být vždy mocnina dvojky (64, 128, 256, 512...). Většina hardwaru vyžaduje true.",
                     );
                     if ui.button("true").clicked() {
                         client.send_command(IpcRequest::SetPwSetting {
@@ -247,7 +293,8 @@ impl SettingsViewState {
                     }
                     if let Some(cfg) = config
                         && ui
-                            .button("Uložit aktuální DSP limity do rules.toml")
+                            .button("Uložit limity natrvalo do rules.toml")
+                            .on_hover_text("Zapíše min/max/limit quantum do konfigurace, takže přežijí i restart PC")
                             .clicked()
                     {
                         let mut next = cfg.clone();
@@ -270,14 +317,21 @@ impl SettingsViewState {
                     let cur_sink = runtime.and_then(|r| r.default_audio_sink.as_deref());
                     let cur_src = runtime.and_then(|r| r.default_audio_source.as_deref());
 
-                    ui.label(egui::RichText::new("Výstupy (Sinks):").color(theme::TEXT_MUTED));
+                    ui.label(egui::RichText::new("Výstupy (Sluchátka / Repro):").color(theme::TEXT_MUTED))
+                        .on_hover_text("Vyber výchozí zvukový výstup pro celý systém");
                     ui.horizontal_wrapped(|ui| {
-                        for node in graph.nodes.iter().filter(|n| {
-                            n.media_class.as_deref().is_some_and(|c| c.contains("Sink"))
-                        }) {
+                        for node in graph
+                            .nodes
+                            .iter()
+                            .filter(|n| n.media_class.as_deref().is_some_and(|c| c.contains("Sink")))
+                        {
                             if let Some(name) = &node.node_name {
                                 let is_cur = cur_sink == Some(name.as_str());
-                                if ui.selectable_label(is_cur, &node.label).clicked() {
+                                if ui
+                                    .selectable_label(is_cur, &node.label)
+                                    .on_hover_text(format!("PipeWire ID: {name}"))
+                                    .clicked()
+                                {
                                     client.send_command(IpcRequest::SetDefaultDevice {
                                         kind: DefaultDeviceKind::Sink,
                                         node_name: Some(name.clone()),
@@ -288,10 +342,8 @@ impl SettingsViewState {
                     });
 
                     ui.add_space(4.0);
-                    ui.label(
-                        egui::RichText::new("Vstupy / Mikrofony (Sources):")
-                            .color(theme::TEXT_MUTED),
-                    );
+                    ui.label(egui::RichText::new("Vstupy / Mikrofony:").color(theme::TEXT_MUTED))
+                        .on_hover_text("Vyber výchozí mikrofon pro prohlížeč, hry a Discord");
                     ui.horizontal_wrapped(|ui| {
                         for node in graph.nodes.iter().filter(|n| {
                             n.media_class
@@ -300,7 +352,11 @@ impl SettingsViewState {
                         }) {
                             if let Some(name) = &node.node_name {
                                 let is_cur = cur_src == Some(name.as_str());
-                                if ui.selectable_label(is_cur, &node.label).clicked() {
+                                if ui
+                                    .selectable_label(is_cur, &node.label)
+                                    .on_hover_text(format!("PipeWire ID: {name}"))
+                                    .clicked()
+                                {
                                     client.send_command(IpcRequest::SetDefaultDevice {
                                         kind: DefaultDeviceKind::Source,
                                         node_name: Some(name.clone()),
@@ -331,7 +387,9 @@ impl SettingsViewState {
                                 );
                                 ui.label(egui::RichText::new(k).monospace());
                                 ui.label(
-                                    egui::RichText::new(v).monospace().color(theme::TEXT_MUTED),
+                                    egui::RichText::new(v)
+                                        .monospace()
+                                        .color(theme::TEXT_MUTED),
                                 );
                                 ui.end_row();
                             }
@@ -343,7 +401,9 @@ impl SettingsViewState {
                                 );
                                 ui.label(egui::RichText::new(k).monospace());
                                 ui.label(
-                                    egui::RichText::new(v).monospace().color(theme::TEXT_MUTED),
+                                    egui::RichText::new(v)
+                                        .monospace()
+                                        .color(theme::TEXT_MUTED),
                                 );
                                 ui.end_row();
                             }
@@ -355,7 +415,9 @@ impl SettingsViewState {
                                 );
                                 ui.label(egui::RichText::new(k).monospace());
                                 ui.label(
-                                    egui::RichText::new(v).monospace().color(theme::TEXT_MUTED),
+                                    egui::RichText::new(v)
+                                        .monospace()
+                                        .color(theme::TEXT_MUTED),
                                 );
                                 ui.end_row();
                             }
@@ -366,14 +428,16 @@ impl SettingsViewState {
     }
 }
 
-fn kv(ui: &mut egui::Ui, label: &str, value: &str) {
+fn kv(ui: &mut egui::Ui, label: &str, value: &str, tooltip: &str) {
     ui.vertical(|ui| {
         ui.label(
             egui::RichText::new(label)
                 .size(11.0)
                 .color(theme::TEXT_MUTED),
-        );
-        ui.label(egui::RichText::new(value).strong());
+        )
+        .on_hover_text(tooltip);
+        ui.label(egui::RichText::new(value).strong())
+            .on_hover_text(tooltip);
     });
 }
 
@@ -382,15 +446,18 @@ fn setting_row(
     key: &str,
     buf: &mut String,
     hint: &str,
+    tooltip: &str,
     target: MetadataTarget,
     client: &CrimpClient,
 ) {
-    ui.label(egui::RichText::new(key).monospace());
+    ui.label(egui::RichText::new(key).monospace())
+        .on_hover_text(tooltip);
     ui.add(
         egui::TextEdit::singleline(buf)
             .desired_width(180.0)
             .hint_text(hint),
-    );
+    )
+    .on_hover_text(tooltip);
     ui.horizontal(|ui| {
         if ui.button("Použít").clicked() {
             let trimmed = buf.trim();

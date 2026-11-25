@@ -92,6 +92,16 @@ impl RuleEngine {
             .map(|rule| rule.name.clone())
     }
 
+    /// Vrátí uživatelský alias uzlu, pokud odpovídá některému pravidlu `[[alias]]`.
+    #[must_use]
+    pub fn resolve_alias(&self, node: &NodeInfo) -> Option<String> {
+        self.config
+            .alias
+            .iter()
+            .rfind(|a| matcher_matches_node(&a.matcher, node))
+            .map(|a| a.display_name.clone())
+    }
+
     fn find_matching_deny(
         &self,
         output_node: Option<&NodeInfo>,
@@ -651,5 +661,55 @@ mod tests {
         let engine = RuleEngine::new(cfg);
         let dsp = engine.evaluate_dsp(&graph, None, None);
         assert_eq!((dsp.quantum, dsp.rate), (Some(64), Some(96000)));
+    }
+
+    #[test]
+    fn resolves_custom_node_aliases_distinguishing_media_class() {
+        let cfg = Config {
+            alias: vec![
+                crate::config::AliasRule {
+                    matcher: NodeMatcher {
+                        node_name: Some("java".into()),
+                        media_class: Some("Stream/Output/Audio".into()),
+                        ..Default::default()
+                    },
+                    display_name: "Minecraft (Zvuk)".into(),
+                },
+                crate::config::AliasRule {
+                    matcher: NodeMatcher {
+                        node_name: Some("java".into()),
+                        media_class: Some("Stream/Input/Audio".into()),
+                        ..Default::default()
+                    },
+                    display_name: "Minecraft (Mic)".into(),
+                },
+            ],
+            ..Default::default()
+        };
+        let engine = RuleEngine::new(cfg);
+
+        let mc_out = NodeInfo {
+            id: 1,
+            node_name: Some("java".into()),
+            node_description: None,
+            application_name: None,
+            media_class: Some("Stream/Output/Audio".into()),
+            node_latency: None,
+            node_rate: None,
+        };
+        let mc_in = NodeInfo {
+            id: 2,
+            media_class: Some("Stream/Input/Audio".into()),
+            ..mc_out.clone()
+        };
+
+        assert_eq!(
+            engine.resolve_alias(&mc_out).as_deref(),
+            Some("Minecraft (Zvuk)")
+        );
+        assert_eq!(
+            engine.resolve_alias(&mc_in).as_deref(),
+            Some("Minecraft (Mic)")
+        );
     }
 }

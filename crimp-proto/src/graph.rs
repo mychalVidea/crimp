@@ -184,6 +184,8 @@ pub struct NodeSnapshot {
     pub node_latency: Option<String>,
     pub node_rate: Option<String>,
     pub is_virtual_crimp: bool,
+    #[serde(default)]
+    pub has_custom_alias: bool,
     pub output_ports: Vec<PortInfo>,
     pub input_ports: Vec<PortInfo>,
 }
@@ -312,16 +314,19 @@ impl AudioGraph {
         (self.nodes.len(), self.ports.len(), self.links.len())
     }
 
-    /// Vytvoří JSON-ready snímek celého grafu s označenými virtuálními sinky a vynucenými linky.
+    /// Vytvoří JSON-ready snímek celého grafu s označenými virtuálními sinky, aliasy a vynucenými linky.
     #[must_use]
-    pub fn snapshot_with_annotations<F>(
+    pub fn snapshot_with_annotations<F, A>(
         &self,
         virtual_sink_names: &HashSet<String>,
         route_lookup: F,
+        alias_lookup: A,
     ) -> GraphSnapshot
     where
         F: Fn(&ResolvedLink<'_>) -> Option<String>,
+        A: Fn(&NodeInfo) -> Option<String>,
     {
+        let mut labels_by_id = BTreeMap::new();
         let nodes = self
             .nodes
             .values()
@@ -340,9 +345,13 @@ impl AudioGraph {
                     .node_name
                     .as_ref()
                     .is_some_and(|name| virtual_sink_names.contains(name));
+                let custom_alias = alias_lookup(node);
+                let has_custom_alias = custom_alias.is_some();
+                let label = custom_alias.unwrap_or_else(|| node.display_label());
+                labels_by_id.insert(node.id, label.clone());
                 NodeSnapshot {
                     id: node.id,
-                    label: node.display_label(),
+                    label,
                     node_name: node.node_name.clone(),
                     node_description: node.node_description.clone(),
                     application_name: node.application_name.clone(),
@@ -350,6 +359,7 @@ impl AudioGraph {
                     node_latency: node.node_latency.clone(),
                     node_rate: node.node_rate.clone(),
                     is_virtual_crimp,
+                    has_custom_alias,
                     output_ports,
                     input_ports,
                 }
@@ -367,16 +377,16 @@ impl AudioGraph {
                     id: link.id,
                     output_node_id: link.output_node_id,
                     output_port_id: link.output_port_id,
-                    output_label: self.nodes.get(&link.output_node_id).map_or_else(
-                        || format!("node#{}", link.output_node_id),
-                        NodeInfo::display_label,
-                    ),
+                    output_label: labels_by_id
+                        .get(&link.output_node_id)
+                        .cloned()
+                        .unwrap_or_else(|| format!("node#{}", link.output_node_id)),
                     input_node_id: link.input_node_id,
                     input_port_id: link.input_port_id,
-                    input_label: self.nodes.get(&link.input_node_id).map_or_else(
-                        || format!("node#{}", link.input_node_id),
-                        NodeInfo::display_label,
-                    ),
+                    input_label: labels_by_id
+                        .get(&link.input_node_id)
+                        .cloned()
+                        .unwrap_or_else(|| format!("node#{}", link.input_node_id)),
                     enforced_by_rule,
                 }
             })

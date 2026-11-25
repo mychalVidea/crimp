@@ -209,6 +209,27 @@ impl RulesViewState {
                         });
                     }
 
+                    for (idx, alias) in cfg.alias.iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            ui.colored_label(theme::HARDWARE_AMBER, "ALIAS");
+                            ui.label(format!(
+                                "{}  <-  {}",
+                                alias.display_name,
+                                alias
+                                    .matcher
+                                    .node_name
+                                    .as_deref()
+                                    .or(alias.matcher.application_name.as_deref())
+                                    .unwrap_or("*")
+                            ));
+                            if ui.small_button("Smazat").clicked() {
+                                let mut next = cfg.clone();
+                                next.alias.remove(idx);
+                                edited = Some(next);
+                            }
+                        });
+                    }
+
                     if let Some(next) = edited {
                         client.send_command(IpcRequest::SaveConfig { config: next });
                     }

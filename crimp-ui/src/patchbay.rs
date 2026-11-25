@@ -1,11 +1,16 @@
 use crate::client::CrimpClient;
+use crate::layout_store::{
+    SavedLayout, arr_to_pos, arr_to_vec, compute_stable_keys, load_saved_layout, pos_to_arr,
+    save_layout, vec_to_arr,
+};
 use crate::theme;
-use crimp_proto::config::{Config, DenyRule, NodeMatcher, RouteRule};
+use crimp_proto::config::{AliasRule, Config, DenyRule, NodeMatcher, RouteRule};
 use crimp_proto::graph::{GraphSnapshot, NodeSnapshot, PortInfo};
 use crimp_proto::ipc::{DefaultDeviceKind, IpcRequest};
 use egui::epaint::{CubicBezierShape, PathStroke, Shadow};
 use egui::{Align2, Color32, CornerRadius, FontId, Pos2, Rect, Sense, Stroke, Vec2};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 const HEADER_HEIGHT: f32 = 44.0;
 const PORT_ROW_HEIGHT: f32 = 24.0;
@@ -17,36 +22,69 @@ struct PendingDragLink {
     output_port_id: u32,
 }
 
-/// Stav interaktivního audio Patchbay plátna (vzhled Studio / Apple Matte Obsidian).
+/// Stav interaktivního audio Patchbay plátna s trvalým ukládáním layoutu a aliasů.
 pub struct PatchbayState {
     positions: HashMap<u32, Pos2>,
+    saved: SavedLayout,
     pan: Vec2,
     zoom: f32,
     needs_fit: bool,
     hide_internal_and_midi: bool,
+    layout_dirty_since: Option<Instant>,
     dragging_link: Option<PendingDragLink>,
     selected_node_id: Option<u32>,
     selected_link_id: Option<u32>,
+    alias_input: String,
+    alias_for_node_id: Option<u32>,
     filter_query: String,
 }
 
 impl Default for PatchbayState {
     fn default() -> Self {
+        let saved = load_saved_layout();
+        let has_saved_positions = !saved.node_positions.is_empty();
+        let pan = arr_to_vec(saved.pan);
+        let zoom = saved.zoom.clamp(0.45, 1.75);
+        let hide_internal_and_midi = saved.hide_internal_and_midi;
         Self {
             positions: HashMap::new(),
-            pan: Vec2::new(40.0, 40.0),
-            zoom: 1.0,
-            needs_fit: true,
-            hide_internal_and_midi: true,
+            saved,
+            pan,
+            zoom,
+            needs_fit: !has_saved_positions,
+            hide_internal_and_midi,
+            layout_dirty_since: None,
             dragging_link: None,
             selected_node_id: None,
             selected_link_id: None,
+            alias_input: String::new(),
+            alias_for_node_id: None,
             filter_query: String::new(),
         }
     }
 }
 
 impl PatchbayState {
+    /// Okamžitě zapíše aktuální pozice uzlů, pan a zoom do `~/.config/crimp/ui-layout.json`.
+    pub fn flush_saved_layout(&mut self, graph: Option<&GraphSnapshot>) {
+        if let Some(g) = graph {
+            let refs: Vec<&NodeSnapshot> = g.nodes.iter().collect();
+            let stable_keys = compute_stable_keys(&refs);
+            for (node_id, pos) in &self.positions {
+                if let Some(key) = stable_keys.get(node_id) {
+                    self.saved
+                        .node_positions
+                        .insert(key.clone(), pos_to_arr(*pos));
+                }
+            }
+        }
+        self.saved.pan = vec_to_arr(self.pan);
+        self.saved.zoom = self.zoom;
+        self.saved.hide_internal_and_midi = self.hide_internal_and_midi;
+        save_layout(&self.saved);
+        self.layout_dirty_since = None;
+    }
+
     pub fn show(
         &mut self,
         ui: &mut egui::Ui,
@@ -65,24 +103,50 @@ impl PatchbayState {
             return;
         };
 
+        // Pravidelné debounced uložení změněného rozvržení
+        if let Some(since) = self.layout_dirty_since
+            && since.elapsed() >= Duration::from_millis(550)
+        {
+            self.flush_saved_layout(Some(graph));
+        }
+
         // Horní ovládací pruh patchbaye
         ui.horizontal(|ui| {
             ui.add(
                 egui::TextEdit::singleline(&mut self.filter_query)
                     .desired_width(200.0)
-                    .hint_text("Hledat aplikaci nebo zařízení..."),
+                    .hint_text("Hledat aplikaci, alias nebo zařízení..."),
             );
-            if ui.button("Auto-layout").clicked() {
+            if ui
+                .button("Auto-layout")
+                .on_hover_text("Vyresetuje uložené pozice a znovu srovná uzly do sloupců")
+                .clicked()
+            {
                 self.positions.clear();
+                self.saved.node_positions.clear();
                 self.needs_fit = true;
+                self.mark_dirty();
             }
-            if ui.button("Vycentrovat").clicked() {
+            if ui
+                .button("Vycentrovat")
+                .on_hover_text("Přizpůsobí pohled tak, aby byly vidět všechny uzly")
+                .clicked()
+            {
                 self.needs_fit = true;
+                self.mark_dirty();
             }
-            ui.checkbox(
-                &mut self.hide_internal_and_midi,
-                "Jen Audio (skrýt Dummy/MIDI)",
-            );
+            if ui
+                .checkbox(
+                    &mut self.hide_internal_and_midi,
+                    "Jen Audio (skrýt Dummy/MIDI)",
+                )
+                .on_hover_text(
+                    "Skryje interní PipeWire drivery a prázdné MIDI mosty pro přehlednější graf",
+                )
+                .changed()
+            {
+                self.mark_dirty();
+            }
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.label(
@@ -102,8 +166,8 @@ impl PatchbayState {
         let inspector_open = self.selected_node_id.is_some() || self.selected_link_id.is_some();
         if inspector_open {
             egui::Panel::right("patchbay_inspector")
-                .default_size(300.0)
-                .min_size(250.0)
+                .default_size(310.0)
+                .min_size(260.0)
                 .frame(
                     egui::Frame::new()
                         .fill(theme::BG_SECONDARY)
@@ -125,7 +189,7 @@ impl PatchbayState {
             .filter(|node| self.matches_filter(node))
             .collect();
 
-        self.ensure_initial_layout(&visible_nodes);
+        self.ensure_layout(graph, &visible_nodes);
 
         egui::CentralPanel::default()
             .frame(
@@ -137,6 +201,10 @@ impl PatchbayState {
             .show(ui, |ui| {
                 self.draw_canvas(ui, graph, &visible_nodes, client);
             });
+    }
+
+    fn mark_dirty(&mut self) {
+        self.layout_dirty_since = Some(Instant::now());
     }
 
     fn matches_filter(&self, node: &NodeSnapshot) -> bool {
@@ -153,22 +221,55 @@ impl PatchbayState {
                 .as_deref()
                 .is_some_and(|s| s.to_ascii_lowercase().contains(&q))
             || node
+                .application_name
+                .as_deref()
+                .is_some_and(|s| s.to_ascii_lowercase().contains(&q))
+            || node
                 .media_class
                 .as_deref()
                 .is_some_and(|s| s.to_ascii_lowercase().contains(&q))
     }
 
-    fn ensure_initial_layout(&mut self, nodes: &[&NodeSnapshot]) {
-        let mut col_y = [0.0f32; 3];
-        for &node in nodes {
+    fn ensure_layout(&mut self, graph: &GraphSnapshot, visible_nodes: &[&NodeSnapshot]) {
+        let all_refs: Vec<&NodeSnapshot> = graph.nodes.iter().collect();
+        let stable_keys = compute_stable_keys(&all_refs);
+
+        // Nejprve doplníme pozice ze SavedLayout pro nově připojené / probuzené uzly.
+        for &node in visible_nodes {
+            if self.positions.contains_key(&node.id) {
+                continue;
+            }
+            if let Some(key) = stable_keys.get(&node.id)
+                && let Some(&saved_xy) = self.saved.node_positions.get(key)
+            {
+                self.positions.insert(node.id, arr_to_pos(saved_xy));
+            }
+        }
+
+        // Pro zbylé (zcela nové) uzly najdeme volné místo pod stávajícími uzly v příslušném sloupci.
+        let mut col_max_y = [0.0f32; 3];
+        for &node in visible_nodes {
+            if let Some(pos) = self.positions.get(&node.id) {
+                let col = classify_column(node);
+                col_max_y[col] = col_max_y[col].max(pos.y + node_height(node) + 32.0);
+            }
+        }
+
+        let mut placed_new = false;
+        for &node in visible_nodes {
             if self.positions.contains_key(&node.id) {
                 continue;
             }
             let col = classify_column(node);
             let x = col as f32 * 390.0;
-            let y = col_y[col];
+            let y = col_max_y[col];
             self.positions.insert(node.id, Pos2::new(x, y));
-            col_y[col] += node_height(node) + 32.0;
+            col_max_y[col] += node_height(node) + 32.0;
+            placed_new = true;
+        }
+
+        if placed_new {
+            self.mark_dirty();
         }
     }
 
@@ -240,6 +341,7 @@ impl PatchbayState {
                 } else {
                     self.zoom = new_zoom;
                 }
+                self.mark_dirty();
             }
         }
 
@@ -248,6 +350,7 @@ impl PatchbayState {
                 && self.dragging_link.is_none())
         {
             self.pan += canvas_resp.drag_delta();
+            self.mark_dirty();
         }
 
         if canvas_resp.clicked() {
@@ -260,6 +363,7 @@ impl PatchbayState {
         let mut port_screen_pos: HashMap<u32, Pos2> = HashMap::new();
         let mut in_pin_rects: Vec<(u32, u32, Rect)> = Vec::new();
         let mut out_pin_rects: Vec<(u32, u32, Rect)> = Vec::new();
+        let pointer_pos = ui.input(|i| i.pointer.hover_pos());
 
         // Kreslení karet uzlů
         for &node in visible_nodes {
@@ -273,7 +377,6 @@ impl PatchbayState {
             let accent = node_accent_color(node);
             let rounding = CornerRadius::same((10.0 * self.zoom).round().clamp(5.0, 14.0) as u8);
 
-            // Měkký Apple drop-shadow pod kartou
             let shadow = Shadow {
                 offset: [0, 6],
                 blur: 18,
@@ -282,7 +385,6 @@ impl PatchbayState {
             };
             painter.add(shadow.as_shape(rect, rounding));
 
-            // Tělo karty
             let border_color = if is_selected {
                 theme::ACCENT_BLUE
             } else {
@@ -296,7 +398,6 @@ impl PatchbayState {
                 egui::StrokeKind::Inside,
             );
 
-            // Tónovaná hlavička
             let header_rect =
                 Rect::from_min_size(rect.min, Vec2::new(rect.width(), HEADER_HEIGHT * self.zoom));
             let header_rounding = CornerRadius {
@@ -310,7 +411,6 @@ impl PatchbayState {
                 [header_rect.left_bottom(), header_rect.right_bottom()],
                 Stroke::new(1.0, theme::BORDER_SUBTLE),
             );
-            // Horní 1px specular odlesk
             painter.line_segment(
                 [
                     Pos2::new(rect.left() + 10.0, rect.top() + 1.0),
@@ -319,7 +419,6 @@ impl PatchbayState {
                 Stroke::new(1.0, theme::SPECULAR_TOP),
             );
 
-            // Barevný levý akcent v záhlaví
             let pill_rect = Rect::from_min_size(
                 Pos2::new(
                     header_rect.left() + 10.0 * self.zoom,
@@ -329,13 +428,13 @@ impl PatchbayState {
             );
             painter.rect_filled(pill_rect, CornerRadius::same(2), accent);
 
-            // Přetahování uzlu přes záhlaví
             let header_id = ui.scope_id().with(("node_drag", node.id));
             let header_resp = ui.interact(header_rect, header_id, Sense::click_and_drag());
             if header_resp.dragged()
                 && let Some(pos) = self.positions.get_mut(&node.id)
             {
                 *pos += header_resp.drag_delta() / self.zoom;
+                self.mark_dirty();
             }
             if header_resp.clicked() {
                 self.selected_node_id = Some(node.id);
@@ -364,7 +463,6 @@ impl PatchbayState {
                 },
             );
 
-            // Seřazené porty (FL před FR atd., aby se linky zbytečně nekřížily!)
             let in_ports = sorted_ports(&node.input_ports);
             let out_ports = sorted_ports(&node.output_ports);
             let has_both = !in_ports.is_empty() && !out_ports.is_empty();
@@ -380,12 +478,11 @@ impl PatchbayState {
                     let hit_rect = Rect::from_center_size(pin_pos, Vec2::splat(16.0 * self.zoom));
                     in_pin_rects.push((node.id, in_port.id, hit_rect));
 
-                    painter.circle_filled(pin_pos, PORT_PIN_RADIUS * self.zoom, theme::BG_OBSIDIAN);
-                    painter.circle_stroke(
-                        pin_pos,
-                        PORT_PIN_RADIUS * self.zoom,
-                        Stroke::new(1.8, theme::ACCENT_BLUE),
-                    );
+                    let pin_hover = self.dragging_link.is_some()
+                        && pointer_pos.is_some_and(|p| hit_rect.contains(p));
+                    let r = (PORT_PIN_RADIUS + if pin_hover { 1.8 } else { 0.0 }) * self.zoom;
+                    painter.circle_filled(pin_pos, r, theme::BG_OBSIDIAN);
+                    painter.circle_stroke(pin_pos, r, Stroke::new(1.9, theme::ACCENT_BLUE));
                     painter.text(
                         Pos2::new(pin_pos.x + 12.0 * self.zoom, row_y),
                         Align2::LEFT_CENTER,
@@ -401,12 +498,10 @@ impl PatchbayState {
                     let hit_rect = Rect::from_center_size(pin_pos, Vec2::splat(16.0 * self.zoom));
                     out_pin_rects.push((node.id, out_port.id, hit_rect));
 
-                    painter.circle_filled(pin_pos, PORT_PIN_RADIUS * self.zoom, theme::BG_OBSIDIAN);
-                    painter.circle_stroke(
-                        pin_pos,
-                        PORT_PIN_RADIUS * self.zoom,
-                        Stroke::new(1.8, theme::ECONOMY_GREEN),
-                    );
+                    let pin_hover = pointer_pos.is_some_and(|p| hit_rect.contains(p));
+                    let r = (PORT_PIN_RADIUS + if pin_hover { 1.4 } else { 0.0 }) * self.zoom;
+                    painter.circle_filled(pin_pos, r, theme::BG_OBSIDIAN);
+                    painter.circle_stroke(pin_pos, r, Stroke::new(1.9, theme::ECONOMY_GREEN));
                     painter.text(
                         Pos2::new(pin_pos.x - 12.0 * self.zoom, row_y),
                         Align2::RIGHT_CENTER,
@@ -418,7 +513,7 @@ impl PatchbayState {
             }
         }
 
-        // Tahání nového kabelu z Output pinu
+        // Tahání nového kabelu z Output pinu (povoluje i více linek do stejného vstupního portu - fan-in mix!)
         for &(out_node_id, out_port_id, hit_rect) in &out_pin_rects {
             let resp = ui.interact(
                 hit_rect,
@@ -433,10 +528,35 @@ impl PatchbayState {
             }
         }
 
-        // Kreslení kabelů (se spodním tmavým halo pruhem pro čitelné křížení)
-        let pointer_pos = ui.input(|i| i.pointer.hover_pos());
+        // Vyhledání přesně jednoho nejbližšího kabelu pod kurzorem (i při více linkách do jednoho pinu)
+        let hovered_link_id = pointer_pos.and_then(|ptr| {
+            graph
+                .links
+                .iter()
+                .filter_map(|link| {
+                    let (p0, p3) = (
+                        *port_screen_pos.get(&link.output_port_id)?,
+                        *port_screen_pos.get(&link.input_port_id)?,
+                    );
+                    let dist = bezier_min_distance(p0, p3, ptr);
+                    (dist <= 9.5).then_some((link.id, dist))
+                })
+                .min_by(|a, b| a.1.total_cmp(&b.1))
+                .map(|(id, _)| id)
+        });
+
         let primary_clicked = ui.input(|i| i.pointer.primary_clicked());
         let secondary_clicked = ui.input(|i| i.pointer.secondary_clicked());
+
+        if let Some(link_id) = hovered_link_id {
+            if primary_clicked || secondary_clicked {
+                self.selected_link_id = Some(link_id);
+                self.selected_node_id = None;
+            }
+            if secondary_clicked {
+                client.send_command(IpcRequest::DestroyLink { link_id });
+            }
+        }
 
         for link in &graph.links {
             let (Some(&p0), Some(&p3)) = (
@@ -446,16 +566,8 @@ impl PatchbayState {
                 continue;
             };
 
-            let hovered = pointer_pos.is_some_and(|ptr| bezier_near_point(p0, p3, ptr, 9.0));
+            let hovered = hovered_link_id == Some(link.id);
             let selected = self.selected_link_id == Some(link.id);
-
-            if hovered && (primary_clicked || secondary_clicked) {
-                self.selected_link_id = Some(link.id);
-                self.selected_node_id = None;
-            }
-            if hovered && secondary_clicked {
-                client.send_command(IpcRequest::DestroyLink { link_id: link.id });
-            }
 
             let color = if selected {
                 Color32::WHITE
@@ -549,7 +661,7 @@ impl PatchbayState {
                     ui.colored_label(theme::ACCENT_BLUE, format!("Vynuceno: {rule}"));
                 }
                 ui.add_space(10.0);
-                if ui.button("Rozpojit link").clicked() {
+                if ui.button("Rozpojit tento link").clicked() {
                     client.send_command(IpcRequest::DestroyLink { link_id: link.id });
                     self.selected_link_id = None;
                 }
@@ -588,6 +700,15 @@ impl PatchbayState {
         if let Some(node_id) = self.selected_node_id
             && let Some(node) = graph.nodes.iter().find(|n| n.id == node_id)
         {
+            if self.alias_for_node_id != Some(node.id) {
+                self.alias_for_node_id = Some(node.id);
+                self.alias_input = if node.has_custom_alias {
+                    node.label.clone()
+                } else {
+                    String::new()
+                };
+            }
+
             theme::card_frame().show(ui, |ui| {
                 ui.label(egui::RichText::new(&node.label).strong().size(15.0));
                 ui.label(
@@ -612,10 +733,73 @@ impl PatchbayState {
                         ui.label(egui::RichText::new("media.class").color(theme::TEXT_MUTED));
                         ui.label(node.media_class.as_deref().unwrap_or("-"));
                         ui.end_row();
-                        ui.label(egui::RichText::new("latency").color(theme::TEXT_MUTED));
-                        ui.label(node.node_latency.as_deref().unwrap_or("-"));
-                        ui.end_row();
                     });
+
+                if let Some(cfg) = config {
+                    ui.add_space(10.0);
+                    ui.label(
+                        egui::RichText::new("Vlastní pojmenování (Alias)")
+                            .size(12.0)
+                            .color(theme::TEXT_MUTED),
+                    )
+                    .on_hover_text(
+                        "Přejmenuje tento proces/zařízení jen pro přehlednost v Crimpu. Interně se stále použije pravý PipeWire název.",
+                    );
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.alias_input)
+                            .desired_width(240.0)
+                            .hint_text("Např. Minecraft nebo Sluchátka"),
+                    );
+                    ui.horizontal(|ui| {
+                        if ui.button("Uložit název").clicked() {
+                            let new_name = self.alias_input.trim().to_string();
+                            if !new_name.is_empty() {
+                                let matcher = node_to_exact_alias_matcher(node);
+                                let mut next = cfg.clone();
+                                next.alias.retain(|a| a.matcher != matcher);
+                                next.alias.push(AliasRule {
+                                    matcher,
+                                    display_name: new_name,
+                                });
+                                client.send_command(IpcRequest::SaveConfig { config: next });
+                            }
+                        }
+                        if node.has_custom_alias && ui.button("Původní název").clicked() {
+                            let matcher = node_to_exact_alias_matcher(node);
+                            let mut next = cfg.clone();
+                            next.alias.retain(|a| a.matcher != matcher);
+                            self.alias_input.clear();
+                            client.send_command(IpcRequest::SaveConfig { config: next });
+                        }
+                    });
+                }
+
+                // Rychlé stereo propojení s jiným uzlem jedním klikem (L->L, R->R)
+                if !node.output_ports.is_empty() {
+                    let targets: Vec<&NodeSnapshot> = graph
+                        .nodes
+                        .iter()
+                        .filter(|n| n.id != node.id && !n.input_ports.is_empty() && !is_internal_or_midi_node(n))
+                        .collect();
+                    if !targets.is_empty() {
+                        ui.add_space(10.0);
+                        ui.label(
+                            egui::RichText::new("Rychlé stereo připojení (L->L, R->R):")
+                                .size(12.0)
+                                .color(theme::TEXT_MUTED),
+                        );
+                        egui::ComboBox::from_id_salt(("quick_connect", node.id))
+                            .selected_text("Vyber cílový uzel...")
+                            .width(240.0)
+                            .show_ui(ui, |ui| {
+                                for target in targets {
+                                    if ui.selectable_label(false, &target.label).clicked() {
+                                        connect_stereo_ports(node, target, client);
+                                    }
+                                }
+                            });
+                    }
+                }
 
                 if let Some(name) = &node.node_name {
                     let class = node.media_class.as_deref().unwrap_or("");
@@ -642,12 +826,35 @@ impl PatchbayState {
             ui.add_space(10.0);
             ui.label(
                 egui::RichText::new(
-                    "Přetažením ze zeleného výstupu na modrý vstup vytvoříš propojení. Pravý klik na drát link ihned rozpojí.",
+                    "Tip: Můžeš připojit i více zelených výstupů do jednoho modrého vstupu (např. L+R do jednoho kanálu) – PipeWire zvuk automaticky smíchá. Pravým kliknutím na drát spojení zrušíš.",
                 )
                 .color(theme::TEXT_SUBTLE)
                 .size(11.5),
             );
         }
+    }
+}
+
+fn connect_stereo_ports(src: &NodeSnapshot, dst: &NodeSnapshot, client: &CrimpClient) {
+    let outs = sorted_ports(&src.output_ports);
+    let ins = sorted_ports(&dst.input_ports);
+    let pairs = outs.len().min(ins.len());
+    for i in 0..pairs {
+        client.send_command(IpcRequest::CreateLink {
+            output_node_id: src.id,
+            output_port_id: outs[i].id,
+            input_node_id: dst.id,
+            input_port_id: ins[i].id,
+        });
+    }
+}
+
+fn node_to_exact_alias_matcher(node: &NodeSnapshot) -> NodeMatcher {
+    NodeMatcher {
+        node_name: node.node_name.clone(),
+        application_name: node.application_name.clone(),
+        media_class: node.media_class.clone(),
+        port_name: None,
     }
 }
 
@@ -675,23 +882,29 @@ fn sorted_ports(ports: &[PortInfo]) -> Vec<&PortInfo> {
 }
 
 fn channel_sort_rank(port: &PortInfo) -> (u8, u32) {
-    let key = port
+    let raw_key = port
         .channel
         .as_deref()
+        .filter(|s| !s.trim().is_empty())
         .or_else(|| port.port_name.as_deref().and_then(|n| n.rsplit('_').next()))
         .unwrap_or("")
+        .trim()
         .to_ascii_uppercase();
+
     let is_monitor = port
         .port_name
         .as_deref()
         .is_some_and(|n| n.to_ascii_lowercase().starts_with("monitor"));
-    let base = match key.as_str() {
-        "FL" | "L" | "LEFT" | "AUX0" => 0,
-        "FR" | "R" | "RIGHT" | "AUX1" => 1,
+
+    let base = match raw_key.as_str() {
+        "FL" | "L" | "LEFT" | "AUX0" | "0" | "1" => 0,
+        "FR" | "R" | "RIGHT" | "AUX1" | "2" => 1,
         "FC" | "C" | "CENTER" | "MONO" => 2,
         "LFE" | "SUB" => 3,
         "RL" | "BL" => 4,
         "RR" | "BR" => 5,
+        "SL" => 6,
+        "SR" => 7,
         _ => 20,
     };
     (base + if is_monitor { 30 } else { 0 }, port.id)
@@ -720,6 +933,11 @@ fn node_accent_color(node: &NodeSnapshot) -> Color32 {
 }
 
 fn node_subtitle(node: &NodeSnapshot) -> String {
+    if node.has_custom_alias
+        && let Some(orig) = &node.node_name
+    {
+        return format!("{orig}  ·  #{}", node.id);
+    }
     if node.is_virtual_crimp {
         return format!("Virtual Bus  ·  #{}", node.id);
     }
@@ -805,11 +1023,12 @@ fn draw_cable(painter: &egui::Painter, p0: Pos2, p3: Pos2, color: Color32, width
     ));
 }
 
-fn bezier_near_point(p0: Pos2, p3: Pos2, target: Pos2, threshold: f32) -> bool {
+fn bezier_min_distance(p0: Pos2, p3: Pos2, target: Pos2) -> f32 {
     let dx = ((p3.x - p0.x).abs() * 0.45).max(56.0);
     let p1 = Pos2::new(p0.x + dx, p0.y);
     let p2 = Pos2::new(p3.x - dx, p3.y);
-    let steps = 20;
+    let steps = 24;
+    let mut best = f32::MAX;
     for i in 0..=steps {
         let t = i as f32 / steps as f32;
         let u = 1.0 - t;
@@ -817,11 +1036,9 @@ fn bezier_near_point(p0: Pos2, p3: Pos2, target: Pos2, threshold: f32) -> bool {
             u * u * u * p0.x + 3.0 * u * u * t * p1.x + 3.0 * u * t * t * p2.x + t * t * t * p3.x,
             u * u * u * p0.y + 3.0 * u * u * t * p1.y + 3.0 * u * t * t * p2.y + t * t * t * p3.y,
         );
-        if pt.distance(target) <= threshold {
-            return true;
-        }
+        best = best.min(pt.distance(target));
     }
-    false
+    best
 }
 
 fn truncate_label(text: &str, max_chars: usize) -> String {
@@ -832,3 +1049,7 @@ fn truncate_label(text: &str, max_chars: usize) -> String {
     let truncated: String = text.chars().take(max_chars.saturating_sub(1)).collect();
     format!("{truncated}…")
 }
+
+// Re-export pro potlačení nepoužitého importu BTreeMap v budoucnu (využívá SavedLayout).
+#[allow(dead_code)]
+fn _unused_check(_m: BTreeMap<String, String>) {}

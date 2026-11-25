@@ -128,6 +128,14 @@ pub struct DspProfileRule {
     pub priority: i32,
 }
 
+/// Uživatelské přejmenování procesu nebo audio zařízení pouze pro přehledné zobrazení.
+/// Veškerá PipeWire pravidla a routy nadále používají originální `node.name` / `application.name`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AliasRule {
+    pub matcher: NodeMatcher,
+    pub display_name: String,
+}
+
 /// Konfigurace lokálního Unix Domain Socketu pro CLI a GUI klienty.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
@@ -156,6 +164,7 @@ pub struct Config {
     pub deny: Vec<DenyRule>,
     pub route: Vec<RouteRule>,
     pub dsp_profile: Vec<DspProfileRule>,
+    pub alias: Vec<AliasRule>,
 }
 
 impl Config {
@@ -250,6 +259,15 @@ impl Config {
                 return Err(ConfigError::Validation {
                     rule: rule.name.clone(),
                     reason: "Route pravidlo musí obsahovat neprázdný `source` i `target`".into(),
+                });
+            }
+        }
+
+        for a in &self.alias {
+            if a.matcher.is_empty() || a.display_name.trim().is_empty() {
+                return Err(ConfigError::Validation {
+                    rule: "alias".into(),
+                    reason: "Alias musí obsahovat neprázdný `matcher` a `display_name`".into(),
                 });
             }
         }
