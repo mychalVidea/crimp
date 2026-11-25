@@ -361,6 +361,19 @@ fn main() -> eframe::Result<()> {
     let mut no_tray = false;
     for arg in std::env::args().skip(1) {
         match arg.as_str() {
+            "--help" | "-h" => {
+                println!(
+                    "Použití: crimp-ui [--window | --new-window | --tray | --no-tray | --version | --help]"
+                );
+                return Ok(());
+            }
+            "--version" | "-V" => {
+                let commit = crimp_proto::update::CRIMP_BUILD_COMMIT
+                    .map(|c| format!(" ({c})"))
+                    .unwrap_or_default();
+                println!("crimp-ui {}{}", env!("CARGO_PKG_VERSION"), commit);
+                return Ok(());
+            }
             "--tray" => tray_only = true,
             "--new-window" => force_new_window = true,
             "--no-tray" => no_tray = true,

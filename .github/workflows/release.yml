@@ -14,7 +14,7 @@ permissions:
 jobs:
   build-linux:
     name: Build Linux Prepackage (${{ matrix.target }})
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     strategy:
       matrix:
         include:
@@ -82,7 +82,7 @@ jobs:
             "Section: sound" \
             "Priority: optional" \
             "Architecture: ${{ matrix.deb_arch }}" \
-            "Depends: libpipewire-0.3-0" \
+            "Depends: libpipewire-0.3-0t64 | libpipewire-0.3-0" \
             "Maintainer: mychalVidea <https://github.com/mychalVidea/crimp>" \
             "Description: Lightweight PipeWire Patchbay GUI, router & blocklist daemon" \
             > "${DEB_DIR}/DEBIAN/control"

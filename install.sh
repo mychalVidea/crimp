@@ -188,13 +188,15 @@ if curl -fsSL "${PREPACKAGE_URL}" -o "${TMP_DIR}/crimp-release.tar.gz" 2>/dev/nu
   tar -xzf "${TMP_DIR}/crimp-release.tar.gz" -C "${TMP_DIR}"
   BUNDLE_DIR="${TMP_DIR}/crimp-linux-${ARCH}"
   if [ -x "${BUNDLE_DIR}/crimp" ] && [ -x "${BUNDLE_DIR}/crimp-ui" ]; then
-    install_bundle "${BUNDLE_DIR}"
-    if systemctl --user is-active crimp-tray >/dev/null 2>&1; then
-      systemctl --user restart crimp-tray || true
+    if "${BUNDLE_DIR}/crimp" --version >/dev/null 2>&1 \
+      && "${BUNDLE_DIR}/crimp-ui" --version >/dev/null 2>&1; then
+      install_bundle "${BUNDLE_DIR}"
+      log "Crimp byl úspěšně nainstalován z předkompilovaného balíčku."
+      log "Spusť 'crimp doctor' nebo otevři aplikaci 'Crimp' v menu."
+      exit 0
+    else
+      warn "Předkompilovaný balíček vyžaduje novější systémové knihovny (glibc 2.39+ / libpipewire); sestavuji ze zdrojů..."
     fi
-    log "Crimp byl úspěšně nainstalován z předkompilovaného balíčku."
-    log "Spusť 'crimp doctor' nebo otevři aplikaci 'Crimp' v menu."
-    exit 0
   fi
 fi
 

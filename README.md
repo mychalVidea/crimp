@@ -28,7 +28,7 @@ Odinstalování:
 curl -fsSL https://raw.githubusercontent.com/mychalVidea/crimp/main/install.sh | bash -s -- --uninstall
 ```
 
-Pro **Arch / CachyOS** je připraven [`contrib/PKGBUILD`](contrib/PKGBUILD), pro **Fedoru / Ultramarine** RPM specifikace [`contrib/crimp.spec`](contrib/crimp.spec). Release binárky v GitHub Actions se staví proti konzervativní glibc `2.35` (`ubuntu-22.04`) pro maximální přenositelnost napříč distribucemi.
+Pro **Arch / CachyOS** je připraven [`contrib/PKGBUILD`](contrib/PKGBUILD), pro **Fedoru / Ultramarine** RPM specifikace [`contrib/crimp.spec`](contrib/crimp.spec). Release binárky v GitHub Actions se staví na `ubuntu-24.04` (PipeWire `1.0+`, glibc `2.39+`; na starších systémech `install.sh` automaticky přepne na sestavení ze zdrojů).
 
 ---
 
