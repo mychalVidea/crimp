@@ -77,7 +77,32 @@ pub fn card_frame() -> Frame {
         .fill(SURFACE)
         .stroke(Stroke::new(1.0, BORDER_SUBTLE))
         .corner_radius(CornerRadius::same(10))
-        .inner_margin(Margin::same(14))
+        .inner_margin(Margin::same(16))
+}
+
+/// Vykreslí kartu roztaženou na plnou dostupnou šířku rodiče (zabraňuje smrštění a lámání slov).
+pub fn wide_card(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui)) {
+    card_frame().show(ui, |ui| {
+        ui.set_min_width(ui.available_width());
+        add_contents(ui);
+    });
+}
+
+/// Zvýrazněná karta pro prioritní volby (např. Start se systémem) s čistým rámem bez AI glow.
+pub fn wide_accent_card(
+    ui: &mut egui::Ui,
+    stroke_color: Color32,
+    add_contents: impl FnOnce(&mut egui::Ui),
+) {
+    Frame::new()
+        .fill(SURFACE_HEADER)
+        .stroke(Stroke::new(1.2, stroke_color))
+        .corner_radius(CornerRadius::same(10))
+        .inner_margin(Margin::same(16))
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            add_contents(ui);
+        });
 }
 
 pub fn spec_divider(ui: &mut egui::Ui) {

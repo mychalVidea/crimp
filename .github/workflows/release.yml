@@ -34,6 +34,55 @@ jobs:
       - name: Install Rust 1.100+ toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Compute monotonic release version
+        id: ver
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          BASE_VER="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
+          SHORT_SHA="${GITHUB_SHA::7}"
+          PREV_VER=""
+          PREV_COMMIT=""
+          if gh release download latest -R "${{ github.repository }}" -p version.json -O prev-version.json 2>/dev/null; then
+            PREV_VER="$(python3 -c 'import json; print(json.load(open("prev-version.json")).get("version",""))' 2>/dev/null || true)"
+            PREV_COMMIT="$(python3 -c 'import json; print(json.load(open("prev-version.json")).get("commit",""))' 2>/dev/null || true)"
+          fi
+
+          NEXT_VER="$(python3 - "$BASE_VER" "$PREV_VER" "$PREV_COMMIT" "$SHORT_SHA" <<'PY'
+          import sys
+
+          base_ver, prev_ver, prev_commit, short_sha = sys.argv[1:5]
+
+          def parse(v):
+              nums = [int(x) for x in v.strip().lstrip("v").split(".")[:3]]
+              while len(nums) < 3:
+                  nums.append(0)
+              return tuple(nums)
+
+          base = parse(base_ver)
+          if prev_ver:
+              prev = parse(prev_ver)
+              if (prev[0], prev[1]) == (base[0], base[1]):
+                  if prev_commit == short_sha and prev >= base:
+                      out = prev
+                  else:
+                      out = (prev[0], prev[1], max(prev[2] + 1, base[2]))
+              else:
+                  out = base
+          else:
+              out = base
+
+          print(f"{out[0]}.{out[1]}.{out[2]}")
+          PY
+          )"
+
+          echo "version=${NEXT_VER}" >> "$GITHUB_OUTPUT"
+          echo "Base Cargo.toml=${BASE_VER}, Prev release=${PREV_VER:-none} (${PREV_COMMIT:-none}), Next=${NEXT_VER} (${SHORT_SHA})"
+          if [ "${NEXT_VER}" != "${BASE_VER}" ]; then
+            sed -i -E "s/^version = \"[^\"]+\"/version = \"${NEXT_VER}\"/" Cargo.toml
+            cargo update --workspace --offline
+          fi
+
       - name: Run core tests & build release binaries with build metadata
         env:
           CRIMP_BUILD_COMMIT: ${{ github.sha }}
@@ -44,7 +93,7 @@ jobs:
 
       - name: Package .tar.gz bundle & version.json manifest
         run: |
-          VERSION="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
+          VERSION="${{ steps.ver.outputs.version }}"
           SHORT_SHA="${GITHUB_SHA::7}"
           BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           STAGE="crimp-linux-${{ matrix.arch }}"
@@ -64,7 +113,7 @@ jobs:
 
       - name: Build .deb package
         run: |
-          VERSION="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
+          VERSION="${{ steps.ver.outputs.version }}"
           DEB_DIR="crimp_${VERSION}_${{ matrix.deb_arch }}"
           mkdir -p "${DEB_DIR}/DEBIAN" \
                    "${DEB_DIR}/usr/bin" \

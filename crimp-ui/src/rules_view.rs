@@ -35,7 +35,7 @@ impl RulesViewState {
             // 0. Automatická detekce PipeWire hardwaru
             if let (Some(g), Some(cfg)) = (graph, config) {
                 let topo = analyze_topology(g);
-                theme::card_frame().show(ui, |ui| {
+                theme::wide_card(ui, |ui| {
                     theme::section_label(ui, "Automatická detekce audio hardwaru");
                     ui.add_space(6.0);
                     Grid::new("auto_detect_grid").num_columns(2).spacing([14.0, 4.0]).show(ui, |ui| {
@@ -70,7 +70,7 @@ impl RulesViewState {
             }
 
             // 1. Nový virtuální sink
-            theme::card_frame().show(ui, |ui| {
+            theme::wide_card(ui, |ui| {
                 theme::section_label(ui, "Přidat Virtuální Audio Sběrnici (Null Sink)");
                 ui.add_space(6.0);
                 ui.horizontal_wrapped(|ui| {
@@ -116,7 +116,7 @@ impl RulesViewState {
 
             // 2. Pravidla z rules.toml
             if let Some(cfg) = config {
-                theme::card_frame().show(ui, |ui| {
+                theme::wide_card(ui, |ui| {
                     theme::section_label(ui, "Aktivní Pravidla v rules.toml");
                     ui.add_space(6.0);
 
@@ -238,7 +238,7 @@ impl RulesViewState {
             }
 
             // 3. Historie zablokovaných WirePlumber auto-linků
-            theme::card_frame().show(ui, |ui| {
+            theme::wide_card(ui, |ui| {
                 theme::section_label(ui, "Historie Zablokovaných Auto-Linků");
                 ui.add_space(6.0);
                 if denied_history.is_empty() {
