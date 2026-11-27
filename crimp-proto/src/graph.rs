@@ -297,6 +297,32 @@ impl AudioGraph {
             .collect()
     }
 
+    /// Vrátí ID existujících linků, které vedou ze stejného zdrojového uzlu (`output_node_id`)
+    /// přes jiný výstupní port do téhož cílového vstupního portu (`input_port_id`).
+    /// Linky z jiných zdrojových uzlů zůstávají zachovány (lze míchat více výstupů do jednoho vstupu).
+    #[must_use]
+    pub fn conflicting_same_source_links(
+        &self,
+        output_node_id: u32,
+        output_port_id: u32,
+        input_port_id: u32,
+    ) -> Vec<u32> {
+        self.links
+            .values()
+            .filter(|link| {
+                let same_source_node = link.output_node_id == output_node_id
+                    || self
+                        .ports
+                        .get(&link.output_port_id)
+                        .is_some_and(|p| p.node_id == output_node_id);
+                same_source_node
+                    && link.input_port_id == input_port_id
+                    && link.output_port_id != output_port_id
+            })
+            .map(|link| link.id)
+            .collect()
+    }
+
     #[must_use]
     pub fn resolve_link(&self, link_id: u32) -> Option<ResolvedLink<'_>> {
         let link = self.links.get(&link_id)?;
@@ -460,5 +486,41 @@ mod tests {
             PwRuntimeState::extract_device_name(Some(r#"{"name":"alsa_output.test"}"#)).as_deref(),
             Some("alsa_output.test")
         );
+    }
+
+    #[test]
+    fn same_source_conflicts_while_preserving_other_sources() {
+        let mut graph = AudioGraph::new();
+        // Zdroj 1 (stereo mikrofon): port 11 = FL, port 12 = FR
+        // Zdroj 2 (jiná aplikace, např. Firefox): port 21 = FL
+        // Cíl (vstup): port 31 = input_FL, port 32 = input_FR
+        graph.upsert_link(LinkInfo {
+            id: 100,
+            output_node_id: 1,
+            output_port_id: 11,
+            input_node_id: 3,
+            input_port_id: 31,
+        });
+        graph.upsert_link(LinkInfo {
+            id: 101,
+            output_node_id: 2,
+            output_port_id: 21,
+            input_node_id: 3,
+            input_port_id: 31,
+        });
+        graph.upsert_link(LinkInfo {
+            id: 102,
+            output_node_id: 1,
+            output_port_id: 11,
+            input_node_id: 3,
+            input_port_id: 32,
+        });
+
+        // Připojení FR (12) ze stejného zdroje (1) do input_FL (31) odpojí jen link 100 (FL stejného zdroje),
+        // zatímco jiný zdroj (link 101 z uzlu 2) i druhý vstupní kanál (link 102 do input_FR) zůstanou!
+        assert_eq!(graph.conflicting_same_source_links(1, 12, 31), vec![100]);
+
+        // Připojení dalšího výstupu z úplně jiného uzlu (4) do téhož input_FL (31) nic neodpojí.
+        assert!(graph.conflicting_same_source_links(4, 41, 31).is_empty());
     }
 }

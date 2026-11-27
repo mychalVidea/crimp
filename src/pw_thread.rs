@@ -765,18 +765,15 @@ impl DaemonState {
 
         let mut replaced_count = 0usize;
         if replace_input {
-            let conflicting_links: Vec<u32> = self
-                .graph
-                .links()
-                .filter(|link| {
-                    link.input_port_id == input_port_id && link.output_port_id != output_port_id
-                })
-                .map(|link| link.id)
-                .collect();
+            let conflicting_links = self.graph.conflicting_same_source_links(
+                output_node_id,
+                output_port_id,
+                input_port_id,
+            );
 
             for old_id in conflicting_links {
                 if let Err(err) = self.registry.destroy_global(old_id).into_result() {
-                    warn!(old_id, error = ?err, "Nepodařilo se odpojit předchozí link ze vstupního portu");
+                    warn!(old_id, error = ?err, "Nepodařilo se odpojit předchozí link ze stejného zdrojového uzlu");
                 } else {
                     self.graph.remove_global(old_id);
                     replaced_count += 1;
@@ -825,7 +822,7 @@ impl DaemonState {
         );
         if replaced_count > 0 {
             Ok(format!(
-                "Přepojeno na {output_node_id}:{output_port_id} -> {input_node_id}:{input_port_id} (předchozí kabel odpojen)"
+                "Přepojeno na {output_node_id}:{output_port_id} -> {input_node_id}:{input_port_id} (předchozí kabel ze stejného zdroje odpojen)"
             ))
         } else {
             Ok(format!(

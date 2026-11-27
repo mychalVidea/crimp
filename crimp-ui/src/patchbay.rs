@@ -921,7 +921,7 @@ impl PatchbayState {
             ui.add_space(10.0);
             ui.label(
                 egui::RichText::new(
-                    "Tip: Přetažením na modrý vstupní pin se původní drát na tomto vstupu automaticky odpojí a nahradí novým. Pravým kliknutím na drát spojení zrušíš.",
+                    "Tip: Do jednoho modrého vstupního pinu lze míchat více různých zdrojových uzlů najednou. Ze stejného zdrojového uzlu se předchozí link do téhož vstupu automaticky nahradí novým. Pravým kliknutím na drát spojení zrušíš.",
                 )
                 .color(theme::TEXT_SUBTLE)
                 .size(11.5),
