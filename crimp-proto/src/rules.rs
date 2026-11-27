@@ -160,25 +160,60 @@ impl RuleEngine {
                 continue;
             }
 
-            let Some(target_node) = candidate_targets
-                .iter()
-                .copied()
-                .find(|target| target.id != source_node.id)
-            else {
-                continue;
-            };
-
             let out_ports =
                 filtered_ports(graph, source_node.id, PortDirection::Output, &rule.source);
-            let in_ports =
-                filtered_ports(graph, target_node.id, PortDirection::Input, &rule.target);
-            if out_ports.is_empty() || in_ports.is_empty() {
+            if out_ports.is_empty() {
                 continue;
             }
 
             let out_port_ids: HashSet<u32> = out_ports.iter().map(|p| p.id).collect();
+            let mut has_any_valid_target = false;
 
-            if rule.exclusive {
+            for &target_node in &candidate_targets {
+                if target_node.id == source_node.id {
+                    continue;
+                }
+
+                let in_ports =
+                    filtered_ports(graph, target_node.id, PortDirection::Input, &rule.target);
+                if in_ports.is_empty() {
+                    continue;
+                }
+                has_any_valid_target = true;
+
+                for (out_port, in_port) in pair_ports(&out_ports, &in_ports) {
+                    if graph
+                        .find_link_between_ports(out_port.id, in_port.id)
+                        .is_some()
+                    {
+                        continue;
+                    }
+
+                    if self
+                        .find_matching_deny(
+                            Some(source_node),
+                            Some(out_port),
+                            Some(target_node),
+                            Some(in_port),
+                        )
+                        .is_some()
+                    {
+                        continue;
+                    }
+
+                    if planned_creates.insert((out_port.id, in_port.id)) {
+                        actions.push(RouteAction::CreateLink {
+                            output_node_id: source_node.id,
+                            output_port_id: out_port.id,
+                            input_node_id: target_node.id,
+                            input_port_id: in_port.id,
+                            rule_name: rule.name.clone(),
+                        });
+                    }
+                }
+            }
+
+            if rule.exclusive && has_any_valid_target {
                 for existing in graph.links_from_node(source_node.id) {
                     if !out_port_ids.contains(&existing.output_port_id) {
                         continue;
@@ -191,37 +226,6 @@ impl RuleEngine {
                             rule_name: rule.name.clone(),
                         });
                     }
-                }
-            }
-
-            for (out_port, in_port) in pair_ports(&out_ports, &in_ports) {
-                if graph
-                    .find_link_between_ports(out_port.id, in_port.id)
-                    .is_some()
-                {
-                    continue;
-                }
-
-                if self
-                    .find_matching_deny(
-                        Some(source_node),
-                        Some(out_port),
-                        Some(target_node),
-                        Some(in_port),
-                    )
-                    .is_some()
-                {
-                    continue;
-                }
-
-                if planned_creates.insert((out_port.id, in_port.id)) {
-                    actions.push(RouteAction::CreateLink {
-                        output_node_id: source_node.id,
-                        output_port_id: out_port.id,
-                        input_node_id: target_node.id,
-                        input_port_id: in_port.id,
-                        rule_name: rule.name.clone(),
-                    });
                 }
             }
         }
@@ -988,5 +992,66 @@ mod tests {
         assert!(cfg.deny.is_empty());
         assert_eq!(cfg.route.len(), 1);
         assert!(!cfg.route[0].exclusive);
+    }
+
+    #[test]
+    fn route_connects_all_matching_target_streams() {
+        let mut graph = AudioGraph::new();
+        graph.upsert_node(NodeInfo {
+            id: 1,
+            node_name: Some("alsa_input.usb-HyperX".into()),
+            node_description: None,
+            application_name: None,
+            media_class: Some("Audio/Source".into()),
+            node_latency: None,
+            node_rate: None,
+        });
+        graph.upsert_port(PortInfo {
+            id: 11,
+            node_id: 1,
+            port_name: Some("capture_FL".into()),
+            direction: PortDirection::Output,
+            channel: Some("FL".into()),
+        });
+
+        for (node_id, port_id) in [(2u32, 21u32), (3u32, 31u32)] {
+            graph.upsert_node(NodeInfo {
+                id: node_id,
+                node_name: Some("cs2".into()),
+                node_description: None,
+                application_name: Some("cs2".into()),
+                media_class: Some("Stream/Input/Audio".into()),
+                node_latency: None,
+                node_rate: None,
+            });
+            graph.upsert_port(PortInfo {
+                id: port_id,
+                node_id,
+                port_name: Some("input_FL".into()),
+                direction: PortDirection::Input,
+                channel: Some("FL".into()),
+            });
+        }
+
+        let cfg = Config {
+            route: vec![RouteRule {
+                name: "Mic to CS2".into(),
+                enabled: true,
+                exclusive: false,
+                source: NodeMatcher {
+                    node_name: Some("alsa_input.usb-HyperX".into()),
+                    ..Default::default()
+                },
+                target: NodeMatcher {
+                    application_name: Some("cs2".into()),
+                    ..Default::default()
+                },
+            }],
+            ..Default::default()
+        };
+
+        let engine = RuleEngine::new(cfg);
+        let actions = engine.plan_routes(&graph);
+        assert_eq!(actions.len(), 2);
     }
 }

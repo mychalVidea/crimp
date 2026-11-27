@@ -1,15 +1,22 @@
 use crate::client::CrimpClient;
 use crate::theme;
-use crimp_proto::config::{Config, VirtualSinkRule};
+use crimp_proto::config::{Config, DspProfileRule, NodeMatcher, VirtualSinkRule};
 use crimp_proto::detect::{analyze_topology, apply_suggested_rules};
 use crimp_proto::graph::{DeniedRecord, GraphSnapshot};
 use crimp_proto::ipc::IpcRequest;
+use crimp_proto::scenes::{SceneInfo, StarterSceneKind};
 use egui::{Grid, ScrollArea};
 
 pub struct RulesViewState {
     new_sink_name: String,
     new_sink_desc: String,
     new_sink_stereo: bool,
+    new_scene_name: String,
+    dsp_name: String,
+    dsp_app_pattern: String,
+    dsp_quantum: Option<u32>,
+    dsp_rate: Option<u32>,
+    dsp_priority: i32,
 }
 
 impl Default for RulesViewState {
@@ -18,21 +25,229 @@ impl Default for RulesViewState {
             new_sink_name: String::new(),
             new_sink_desc: String::new(),
             new_sink_stereo: true,
+            new_scene_name: String::new(),
+            dsp_name: String::new(),
+            dsp_app_pattern: String::new(),
+            dsp_quantum: Some(512),
+            dsp_rate: Some(48_000),
+            dsp_priority: 50,
         }
     }
 }
 
 impl RulesViewState {
+    #[allow(clippy::too_many_arguments)]
     pub fn show(
         &mut self,
         ui: &mut egui::Ui,
         config: Option<&Config>,
         graph: Option<&GraphSnapshot>,
         denied_history: &[DeniedRecord],
+        scenes: &[SceneInfo],
+        active_scene_id: Option<&str>,
         client: &CrimpClient,
     ) {
         ScrollArea::vertical().show(ui, |ui| {
-            // 0. Automatická detekce PipeWire hardwaru
+            // 0a. Scény / Presety (1-klik přepínání v UI i v systémové liště)
+            if let Some(cfg) = config {
+                theme::wide_card(ui, |ui| {
+                    theme::section_label(ui, "Scény / Presety (1-klik přepínání i z tray ikony)");
+                    ui.add_space(6.0);
+                    ui.label(
+                        egui::RichText::new(
+                            "Ulož aktuální konfiguraci (DSP, routy, blokace, výchozí zařízení) jako pojmenovanou scénu. Objeví se i v horní liště a pravém kliku na tray ikonu.",
+                        )
+                        .size(12.0)
+                        .color(theme::TEXT_MUTED),
+                    );
+                    ui.add_space(6.0);
+                    ui.horizontal_wrapped(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.new_scene_name)
+                                .desired_width(210.0)
+                                .hint_text("Název scény (např. Stream / OBS)"),
+                        );
+                        if ui.button("Uložit aktuální jako scénu").clicked() {
+                            let name = self.new_scene_name.trim().to_string();
+                            if !name.is_empty() {
+                                client.save_scene(name, cfg.clone());
+                                self.new_scene_name.clear();
+                            }
+                        }
+                        theme::spec_divider(ui);
+                        for preset in [
+                            StarterSceneKind::Gaming,
+                            StarterSceneKind::Studio96k,
+                            StarterSceneKind::AutoBalanced,
+                        ] {
+                            if ui
+                                .button(format!("+ {}", preset.display_name()))
+                                .on_hover_text(
+                                    "Vytvoří startovací scénu z tvých aktuálních pravidel s přednastaveným DSP",
+                                )
+                                .clicked()
+                            {
+                                let next = preset.apply_to(cfg);
+                                client.save_scene(preset.display_name().to_string(), next);
+                            }
+                        }
+                    });
+
+                    if !scenes.is_empty() {
+                        ui.add_space(8.0);
+                        for scene in scenes {
+                            let is_active = active_scene_id == Some(scene.id.as_str());
+                            ui.horizontal(|ui| {
+                                if is_active {
+                                    ui.colored_label(theme::ECONOMY_GREEN, "●");
+                                }
+                                ui.label(egui::RichText::new(&scene.name).strong());
+                                let q_str = scene
+                                    .quantum
+                                    .map_or_else(|| "Auto".into(), |q| q.to_string());
+                                let r_str = scene
+                                    .rate
+                                    .map_or_else(|| "Auto".into(), |r| format!("{r} Hz"));
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "{q_str} @ {r_str}  ·  {} route, {} deny",
+                                        scene.route_count, scene.deny_count
+                                    ))
+                                    .size(11.5)
+                                    .color(theme::TEXT_MUTED),
+                                );
+                                if ui.selectable_label(is_active, "Aktivovat").clicked() {
+                                    client.apply_scene(scene.id.clone());
+                                }
+                                if ui.small_button("Smazat").clicked() {
+                                    client.delete_scene(scene.id.clone());
+                                }
+                            });
+                        }
+                    }
+                });
+                ui.add_space(10.0);
+            }
+
+            // 0b. Přidat Auto DSP Profil ([[dsp_profile]])
+            if let Some(cfg) = config {
+                theme::wide_card(ui, |ui| {
+                    theme::section_label(ui, "Přidat Auto DSP Profil ([[dsp_profile]])");
+                    ui.add_space(6.0);
+                    ui.label(
+                        egui::RichText::new(
+                            "Jakmile se spustí zvolená aplikace (např. *cs2*, REAPER, OBS), Crimp automaticky přepne buffer / frekvenci a po zavření vrátí výchozí nastavení.",
+                        )
+                        .size(12.0)
+                        .color(theme::TEXT_MUTED),
+                    );
+                    ui.add_space(6.0);
+                    ui.horizontal_wrapped(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.dsp_name)
+                                .desired_width(150.0)
+                                .hint_text("Název (např. CS2 Voice)"),
+                        );
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.dsp_app_pattern)
+                                .desired_width(160.0)
+                                .hint_text("Aplikace (např. *cs2*)"),
+                        );
+                        if let Some(g) = graph {
+                            egui::ComboBox::from_id_salt("dsp_pick_running_app")
+                                .selected_text("Vybrat běžící...")
+                                .width(145.0)
+                                .show_ui(ui, |ui| {
+                                    let mut seen = std::collections::BTreeSet::new();
+                                    for n in &g.nodes {
+                                        if let Some(app) = n
+                                            .application_name
+                                            .as_deref()
+                                            .filter(|s| !s.trim().is_empty())
+                                            && seen.insert(app.to_string())
+                                            && ui.selectable_label(false, app).clicked()
+                                        {
+                                            self.dsp_app_pattern = app.to_string();
+                                            if self.dsp_name.trim().is_empty() {
+                                                self.dsp_name = format!("Auto DSP: {app}");
+                                            }
+                                        }
+                                    }
+                                });
+                        }
+                        let q_lbl = self
+                            .dsp_quantum
+                            .map_or_else(|| "Auto".into(), |q| q.to_string());
+                        egui::ComboBox::from_id_salt("rules_dsp_q")
+                            .selected_text(format!("Q: {q_lbl}"))
+                            .width(88.0)
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut self.dsp_quantum, None, "Auto");
+                                for q in [64u32, 128, 256, 512, 1024, 2048] {
+                                    ui.selectable_value(
+                                        &mut self.dsp_quantum,
+                                        Some(q),
+                                        q.to_string(),
+                                    );
+                                }
+                            });
+                        let r_lbl = self
+                            .dsp_rate
+                            .map_or_else(|| "Auto".into(), |r| format!("{r} Hz"));
+                        egui::ComboBox::from_id_salt("rules_dsp_r")
+                            .selected_text(r_lbl)
+                            .width(105.0)
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut self.dsp_rate, None, "Auto");
+                                for r in [44_100u32, 48_000, 88_200, 96_000, 192_000] {
+                                    ui.selectable_value(
+                                        &mut self.dsp_rate,
+                                        Some(r),
+                                        format!("{r} Hz"),
+                                    );
+                                }
+                            });
+                        ui.add(
+                            egui::DragValue::new(&mut self.dsp_priority)
+                                .prefix("Prio: ")
+                                .range(-100..=500),
+                        );
+                        if ui.button("Přidat DSP profil").clicked() {
+                            let pattern = self.dsp_app_pattern.trim().to_string();
+                            if !pattern.is_empty() {
+                                let name = if self.dsp_name.trim().is_empty() {
+                                    format!("Auto DSP: {pattern}")
+                                } else {
+                                    self.dsp_name.trim().to_string()
+                                };
+                                let mut next = cfg.clone();
+                                next.dsp_profile.push(DspProfileRule {
+                                    name,
+                                    enabled: true,
+                                    source: NodeMatcher {
+                                        application_name: Some(pattern),
+                                        ..Default::default()
+                                    },
+                                    quantum: self.dsp_quantum,
+                                    rate: self.dsp_rate,
+                                    priority: self.dsp_priority,
+                                });
+                                client.send_command(IpcRequest::SaveConfig { config: next });
+                                self.dsp_name.clear();
+                                self.dsp_app_pattern.clear();
+                            } else {
+                                client.push_feedback(
+                                    true,
+                                    "Zadej název aplikace nebo vzor (např. *cs2*)",
+                                );
+                            }
+                        }
+                    });
+                });
+                ui.add_space(10.0);
+            }
+
+            // 0c. Automatická detekce PipeWire hardwaru
             if let (Some(g), Some(cfg)) = (graph, config) {
                 let topo = analyze_topology(g);
                 theme::wide_card(ui, |ui| {

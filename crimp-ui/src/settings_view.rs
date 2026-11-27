@@ -240,7 +240,7 @@ impl SettingsViewState {
                                 for node in graph.nodes.iter().filter(|n| {
                                     n.media_class
                                         .as_deref()
-                                        .is_some_and(|c| c.contains("Sink"))
+                                        .is_some_and(|c| c.starts_with("Audio/Sink") || c == "Audio/Duplex")
                                 }) {
                                     if let Some(name) = &node.node_name {
                                         let is_cur = cur_sink == Some(name.as_str());
@@ -282,9 +282,9 @@ impl SettingsViewState {
                             ui.add_space(4.0);
                             ui.horizontal_wrapped(|ui| {
                                 for node in graph.nodes.iter().filter(|n| {
-                                    n.media_class
-                                        .as_deref()
-                                        .is_some_and(|c| c.contains("Source"))
+                                    n.media_class.as_deref().is_some_and(|c| {
+                                        c.starts_with("Audio/Source") || c == "Audio/Duplex"
+                                    })
                                 }) {
                                     if let Some(name) = &node.node_name {
                                         let is_cur = cur_src == Some(name.as_str());

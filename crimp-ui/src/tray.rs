@@ -59,6 +59,11 @@ pub fn restart_tray_if_running() {
     }
 }
 
+/// Požádá běžící tray proces o znovunačtení kontextového menu (např. po uložení nové scény).
+pub fn refresh_tray_menu() {
+    let _ = send_line(&tray_socket_path(), "refresh");
+}
+
 /// Odstraní socket okna při ukončování/restartu.
 pub fn cleanup_window_socket() {
     let _ = fs::remove_file(ui_window_socket_path());
@@ -145,7 +150,7 @@ pub fn run_tray_service_blocking() {
         tray_sock: sock_path.clone(),
         icon: render_tray_icon_argb32(),
     };
-    let _handle = tray.assume_sni_available(true).spawn();
+    let handle = tray.assume_sni_available(true).spawn();
 
     if let Ok(listener) = UnixListener::bind(&sock_path) {
         let _ = listener.set_nonblocking(true);
@@ -154,10 +159,20 @@ pub fn run_tray_service_blocking() {
                 Ok((stream, _)) => {
                     let mut reader = BufReader::new(stream);
                     let mut line = String::new();
-                    if reader.read_line(&mut line).is_ok() && line.trim() == "quit" {
-                        let _ = send_line(&ui_window_socket_path(), "quit");
-                        running.store(false, Ordering::SeqCst);
-                        break;
+                    if reader.read_line(&mut line).is_ok() {
+                        match line.trim() {
+                            "quit" => {
+                                let _ = send_line(&ui_window_socket_path(), "quit");
+                                running.store(false, Ordering::SeqCst);
+                                break;
+                            }
+                            "refresh" => {
+                                if let Ok(ref h) = handle {
+                                    h.update(|_| {});
+                                }
+                            }
+                            _ => {}
+                        }
                     }
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
@@ -219,8 +234,8 @@ impl ksni::Tray for CrimpTray {
     }
 
     fn menu(&self) -> Vec<MenuItem<Self>> {
-        use ksni::menu::StandardItem;
-        vec![
+        use ksni::menu::{StandardItem, SubMenu};
+        let mut items: Vec<MenuItem<Self>> = vec![
             StandardItem {
                 label: "Otevřít Crimp".into(),
                 activate: Box::new(|_this: &mut Self| open_or_focus_window()),
@@ -236,6 +251,40 @@ impl ksni::Tray for CrimpTray {
             }
             .into(),
             MenuItem::Separator,
+        ];
+
+        let scenes = crimp_proto::scenes::list_scenes();
+        if !scenes.is_empty() {
+            let scene_items: Vec<MenuItem<Self>> = scenes
+                .into_iter()
+                .map(|scene| {
+                    let scene_id = scene.id;
+                    StandardItem {
+                        label: scene.name,
+                        activate: Box::new(move |_this: &mut Self| {
+                            if let Ok((_, cfg)) = crimp_proto::scenes::load_scene(&scene_id) {
+                                let sock = resolve_socket_path(None);
+                                let _ =
+                                    send_request(&sock, &IpcRequest::SaveConfig { config: cfg });
+                            }
+                        }),
+                        ..Default::default()
+                    }
+                    .into()
+                })
+                .collect();
+            items.push(
+                SubMenu {
+                    label: "Scény / Profily".into(),
+                    submenu: scene_items,
+                    ..Default::default()
+                }
+                .into(),
+            );
+            items.push(MenuItem::Separator);
+        }
+
+        items.push(
             StandardItem {
                 label: "Načíst pravidla (rules.toml)".into(),
                 activate: Box::new(|_this: &mut Self| {
@@ -245,7 +294,9 @@ impl ksni::Tray for CrimpTray {
                 ..Default::default()
             }
             .into(),
-            MenuItem::Separator,
+        );
+        items.push(MenuItem::Separator);
+        items.push(
             StandardItem {
                 label: "Ukončit Crimp UI".into(),
                 activate: Box::new(|this: &mut Self| {
@@ -256,7 +307,8 @@ impl ksni::Tray for CrimpTray {
                 ..Default::default()
             }
             .into(),
-        ]
+        );
+        items
     }
 }
 

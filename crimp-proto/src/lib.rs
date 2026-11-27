@@ -5,4 +5,6 @@ pub mod detect;
 pub mod graph;
 pub mod ipc;
 pub mod rules;
+pub mod scenes;
+pub mod telemetry;
 pub mod update;

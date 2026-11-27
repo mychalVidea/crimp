@@ -71,6 +71,7 @@ impl CrimpGuiApp {
 
     fn reload_rules_and_layout(&mut self) {
         self.client.send_command(IpcRequest::Reload);
+        self.client.refresh_scenes();
         self.patchbay.reload_layout_from_disk();
         self.settings.reset_dirty_inputs();
     }
@@ -194,6 +195,61 @@ impl eframe::App for CrimpGuiApp {
                             )
                             .on_hover_text("Aktuální PipeWire buffer (vzorky), sample rate a výsledná latence");
                         }
+                    }
+
+                    if snap.audio_health.available {
+                        theme::spec_divider(ui);
+                        let xruns = snap.audio_health.total_xruns;
+                        let (xrun_txt, xrun_col) = if xruns == 0 {
+                            ("0 xruns".to_string(), theme::ECONOMY_GREEN)
+                        } else {
+                            (format!("{xruns} xruns"), theme::DANGER_RED)
+                        };
+                        let mut tip = if xruns == 0 {
+                            format!(
+                                "Zvuk běží čistě bez výpadků (aktivních uzlů: {}).",
+                                snap.audio_health.active_nodes
+                            )
+                        } else {
+                            let offenders: Vec<String> = snap
+                                .audio_health
+                                .per_node
+                                .values()
+                                .filter(|m| m.err_count > 0)
+                                .take(5)
+                                .map(|m| format!("• {} (#{}): {}×", m.name, m.id, m.err_count))
+                                .collect();
+                            format!(
+                                "Detekovány výpadky zvuku (xruns)!\n{}\nTip: zvedni Quantum (např. 256 → 512) v PipeWire Settings.",
+                                offenders.join("\n")
+                            )
+                        };
+                        if snap.audio_health.active_nodes == 0 && xruns == 0 {
+                            tip = "PipeWire profiler aktivní · žádné výpadky (xruns).".into();
+                        }
+                        ui.label(egui::RichText::new(xrun_txt).color(xrun_col).size(12.5))
+                            .on_hover_text(tip);
+                    }
+
+                    if !snap.scenes.is_empty() {
+                        theme::spec_divider(ui);
+                        let active_label = snap
+                            .active_scene_id
+                            .as_deref()
+                            .and_then(|id| snap.scenes.iter().find(|s| s.id == id))
+                            .map_or("Scéna...", |s| s.name.as_str());
+                        egui::ComboBox::from_id_salt("top_bar_scene_picker")
+                            .selected_text(active_label)
+                            .width(125.0)
+                            .show_ui(ui, |ui| {
+                                for scene in &snap.scenes {
+                                    let is_active =
+                                        snap.active_scene_id.as_deref() == Some(scene.id.as_str());
+                                    if ui.selectable_label(is_active, &scene.name).clicked() {
+                                        self.client.apply_scene(scene.id.clone());
+                                    }
+                                }
+                            });
                     }
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -351,8 +407,14 @@ impl eframe::App for CrimpGuiApp {
             )
             .show(ui, |ui| match self.tab {
                 ActiveTab::Patchbay => {
-                    self.patchbay
-                        .show(ui, snap.graph.as_ref(), snap.config.as_ref(), &self.client);
+                    self.patchbay.show(
+                        ui,
+                        snap.graph.as_ref(),
+                        snap.config.as_ref(),
+                        &snap.audio_health,
+                        &snap.volumes,
+                        &self.client,
+                    );
                 }
                 ActiveTab::Settings => {
                     if self.settings.show(
@@ -373,6 +435,8 @@ impl eframe::App for CrimpGuiApp {
                         snap.config.as_ref(),
                         snap.graph.as_ref(),
                         &snap.denied_history,
+                        &snap.scenes,
+                        snap.active_scene_id.as_deref(),
                         &self.client,
                     );
                 }

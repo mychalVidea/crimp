@@ -4,9 +4,10 @@ use crate::layout_store::{
     pos_to_arr, save_layout, vec_to_arr,
 };
 use crate::theme;
-use crimp_proto::config::{AliasRule, Config, DenyRule, NodeMatcher, RouteRule};
+use crimp_proto::config::{AliasRule, Config, DenyRule, DspProfileRule, NodeMatcher, RouteRule};
 use crimp_proto::graph::{GraphSnapshot, NodeSnapshot, PortInfo};
 use crimp_proto::ipc::{DefaultDeviceKind, IpcRequest};
+use crimp_proto::telemetry::{AudioHealthSnapshot, NodeActivityState, NodeVolumeState};
 use egui::epaint::{CubicBezierShape, PathStroke, Shadow};
 use egui::{Align2, Color32, CornerRadius, FontId, Pos2, Rect, Sense, Stroke, Vec2};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -17,12 +18,43 @@ const PORT_ROW_HEIGHT: f32 = 24.0;
 const PORT_PIN_RADIUS: f32 = 5.4;
 const ZOOM_MIN: f32 = 0.35;
 const ZOOM_MAX: f32 = 2.0;
+const MAX_UNDO_HISTORY: usize = 40;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DragOrigin {
+    Output,
+    Input,
+}
 
 #[derive(Debug, Clone, Copy)]
 struct PendingDragLink {
-    output_node_id: u32,
-    output_port_id: u32,
+    origin: DragOrigin,
+    node_id: u32,
+    port_id: u32,
     is_click_mode: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum UndoLinkOp {
+    Create {
+        output_node_id: u32,
+        output_port_id: u32,
+        input_node_id: u32,
+        input_port_id: u32,
+    },
+    Destroy {
+        output_port_id: u32,
+        input_port_id: u32,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct UndoEntry {
+    label: String,
+    prev_config: Option<Config>,
+    next_config: Option<Config>,
+    undo_links: Vec<UndoLinkOp>,
+    redo_links: Vec<UndoLinkOp>,
 }
 
 /// Stav interaktivního audio Patchbay plátna s trvalým ukládáním layoutu a aliasů.
@@ -35,6 +67,7 @@ pub struct PatchbayState {
     hide_internal_and_midi: bool,
     scroll_mode: ScrollMode,
     persist_topology: bool,
+    stereo_link_mode: bool,
     last_wheel_was_point: bool,
     pending_zoom_step: Option<f32>,
     layout_dirty_since: Option<Instant>,
@@ -43,7 +76,13 @@ pub struct PatchbayState {
     selected_link_id: Option<u32>,
     alias_input: String,
     alias_for_node_id: Option<u32>,
+    dsp_for_node_id: Option<u32>,
+    dsp_quantum_choice: Option<u32>,
+    dsp_rate_choice: Option<u32>,
+    dsp_priority: i32,
     filter_query: String,
+    undo_stack: Vec<UndoEntry>,
+    redo_stack: Vec<UndoEntry>,
 }
 
 impl Default for PatchbayState {
@@ -64,6 +103,7 @@ impl Default for PatchbayState {
             hide_internal_and_midi,
             scroll_mode,
             persist_topology,
+            stereo_link_mode: false,
             last_wheel_was_point: true,
             pending_zoom_step: None,
             layout_dirty_since: None,
@@ -72,7 +112,13 @@ impl Default for PatchbayState {
             selected_link_id: None,
             alias_input: String::new(),
             alias_for_node_id: None,
+            dsp_for_node_id: None,
+            dsp_quantum_choice: Some(512),
+            dsp_rate_choice: Some(48_000),
+            dsp_priority: 50,
             filter_query: String::new(),
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
         }
     }
 }
@@ -128,11 +174,123 @@ impl PatchbayState {
         self.mark_dirty();
     }
 
+    fn push_undo(&mut self, entry: UndoEntry) {
+        if self.undo_stack.len() >= MAX_UNDO_HISTORY {
+            self.undo_stack.remove(0);
+        }
+        self.undo_stack.push(entry);
+        self.redo_stack.clear();
+    }
+
+    fn perform_undo(&mut self, graph: &GraphSnapshot, client: &CrimpClient) {
+        let Some(entry) = self.undo_stack.pop() else {
+            return;
+        };
+        if let Some(prev_cfg) = &entry.prev_config {
+            client.send_command(IpcRequest::SaveConfig {
+                config: prev_cfg.clone(),
+            });
+        }
+        apply_undo_link_ops(&entry.undo_links, graph, client);
+        client.push_feedback(false, format!("Vráceno zpět: {}", entry.label));
+        self.redo_stack.push(entry);
+    }
+
+    fn perform_redo(&mut self, graph: &GraphSnapshot, client: &CrimpClient) {
+        let Some(entry) = self.redo_stack.pop() else {
+            return;
+        };
+        if let Some(next_cfg) = &entry.next_config {
+            client.send_command(IpcRequest::SaveConfig {
+                config: next_cfg.clone(),
+            });
+        }
+        apply_undo_link_ops(&entry.redo_links, graph, client);
+        client.push_feedback(false, format!("Znovu provedeno: {}", entry.label));
+        self.undo_stack.push(entry);
+    }
+
+    fn record_and_destroy_link(
+        &mut self,
+        link_id: u32,
+        graph: &GraphSnapshot,
+        config: Option<&Config>,
+        client: &CrimpClient,
+    ) {
+        if let Some(link) = graph.links.iter().find(|l| l.id == link_id) {
+            self.push_undo(UndoEntry {
+                label: format!("Odpojení {} -> {}", link.output_label, link.input_label),
+                prev_config: self.persist_topology.then(|| config.cloned()).flatten(),
+                next_config: None,
+                undo_links: vec![UndoLinkOp::Create {
+                    output_node_id: link.output_node_id,
+                    output_port_id: link.output_port_id,
+                    input_node_id: link.input_node_id,
+                    input_port_id: link.input_port_id,
+                }],
+                redo_links: vec![UndoLinkOp::Destroy {
+                    output_port_id: link.output_port_id,
+                    input_port_id: link.input_port_id,
+                }],
+            });
+        }
+        client.send_command(IpcRequest::DestroyLink {
+            link_id,
+            persist: self.persist_topology,
+        });
+    }
+
+    fn record_and_create_links(
+        &mut self,
+        label: String,
+        pairs: &[(u32, u32, u32, u32)],
+        config: Option<&Config>,
+        client: &CrimpClient,
+    ) {
+        if pairs.is_empty() {
+            return;
+        }
+        self.push_undo(UndoEntry {
+            label,
+            prev_config: self.persist_topology.then(|| config.cloned()).flatten(),
+            next_config: None,
+            undo_links: pairs
+                .iter()
+                .map(|&(_, out_p, _, in_p)| UndoLinkOp::Destroy {
+                    output_port_id: out_p,
+                    input_port_id: in_p,
+                })
+                .collect(),
+            redo_links: pairs
+                .iter()
+                .map(|&(out_n, out_p, in_n, in_p)| UndoLinkOp::Create {
+                    output_node_id: out_n,
+                    output_port_id: out_p,
+                    input_node_id: in_n,
+                    input_port_id: in_p,
+                })
+                .collect(),
+        });
+        for &(out_n, out_p, in_n, in_p) in pairs {
+            client.send_command(IpcRequest::CreateLink {
+                output_node_id: out_n,
+                output_port_id: out_p,
+                input_node_id: in_n,
+                input_port_id: in_p,
+                replace_input: true,
+                persist: self.persist_topology,
+            });
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub fn show(
         &mut self,
         ui: &mut egui::Ui,
         graph: Option<&GraphSnapshot>,
         config: Option<&Config>,
+        health: &AudioHealthSnapshot,
+        volumes: &BTreeMap<u32, NodeVolumeState>,
         client: &CrimpClient,
     ) {
         let Some(graph) = graph else {
@@ -153,8 +311,24 @@ impl PatchbayState {
             self.flush_saved_layout(Some(graph));
         }
 
-        // Klávesové zkratky Patchbaye (Delete odpojí vybraný kabel, Esc zruší tahání/výběr, +/- zoom, F/0 fit)
+        // Klávesové zkratky Patchbaye (Ctrl+Z Undo, Ctrl+Y Redo, Delete odpojí kabel, Esc zruší, +/- zoom, F/0 fit)
         if !ui.ctx().text_edit_focused() {
+            let undo_pressed = ui.input(|i| {
+                (i.modifiers.ctrl || i.modifiers.command)
+                    && !i.modifiers.shift
+                    && i.key_pressed(egui::Key::Z)
+            });
+            let redo_pressed = ui.input(|i| {
+                (i.modifiers.ctrl || i.modifiers.command)
+                    && (i.key_pressed(egui::Key::Y)
+                        || (i.modifiers.shift && i.key_pressed(egui::Key::Z)))
+            });
+            if undo_pressed {
+                self.perform_undo(graph, client);
+            } else if redo_pressed {
+                self.perform_redo(graph, client);
+            }
+
             if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                 if self.dragging_link.is_some() {
                     self.dragging_link = None;
@@ -168,13 +342,14 @@ impl PatchbayState {
                     i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace)
                 })
             {
-                client.send_command(IpcRequest::DestroyLink {
-                    link_id,
-                    persist: self.persist_topology,
-                });
+                self.record_and_destroy_link(link_id, graph, config, client);
                 self.selected_link_id = None;
             }
-            if ui.input(|i| i.key_pressed(egui::Key::F) || i.key_pressed(egui::Key::Num0)) {
+            if ui.input(|i| {
+                !i.modifiers.ctrl
+                    && !i.modifiers.command
+                    && (i.key_pressed(egui::Key::F) || i.key_pressed(egui::Key::Num0))
+            }) {
                 self.needs_fit = true;
                 self.mark_dirty();
             }
@@ -241,6 +416,37 @@ impl PatchbayState {
                 self.mark_dirty();
             }
             if ui
+                .selectable_label(self.stereo_link_mode, "Stereo L+R")
+                .on_hover_text(
+                    "Když je zapnuto (nebo držíš Shift při tahání kabelu), jedním tahem propojíš celý stereo pár (FL→FL + FR→FR) najednou.",
+                )
+                .clicked()
+            {
+                self.stereo_link_mode = !self.stereo_link_mode;
+            }
+            let undo_tip = self
+                .undo_stack
+                .last()
+                .map_or_else(|| "Nic k vrácení (Ctrl+Z)".into(), |e| format!("Zpět (Ctrl+Z): {}", e.label));
+            if ui
+                .add_enabled(!self.undo_stack.is_empty(), egui::Button::new("Zpět"))
+                .on_hover_text(undo_tip)
+                .clicked()
+            {
+                self.perform_undo(graph, client);
+            }
+            let redo_tip = self
+                .redo_stack
+                .last()
+                .map_or_else(|| "Nic k obnovení (Ctrl+Y)".into(), |e| format!("Znovu (Ctrl+Y): {}", e.label));
+            if ui
+                .add_enabled(!self.redo_stack.is_empty(), egui::Button::new("Znovu"))
+                .on_hover_text(redo_tip)
+                .clicked()
+            {
+                self.perform_redo(graph, client);
+            }
+            if ui
                 .button(self.scroll_mode.label())
                 .on_hover_text(
                     "Kliknutím přepneš chování kolečka / touchpadu:\n• Auto: 2 prsty na touchpadu posouvají do všech stran, Ctrl + 2 prsty nebo kolečko myši zoomuje\n• Posun: každý scroll posouvá (zoom přes Ctrl + scroll)\n• Zoom: vertikální scroll zoomuje (posun přes Shift + scroll)",
@@ -304,7 +510,9 @@ impl PatchbayState {
                         .inner_margin(egui::Margin::same(14)),
                 )
                 .show(ui, |ui| {
-                    self.draw_inspector(ui, graph, config, client);
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        self.draw_inspector(ui, graph, config, health, volumes, client);
+                    });
                 });
         }
 
@@ -327,7 +535,7 @@ impl PatchbayState {
                     .corner_radius(CornerRadius::same(10)),
             )
             .show(ui, |ui| {
-                self.draw_canvas(ui, graph, &visible_nodes, client);
+                self.draw_canvas(ui, graph, &visible_nodes, config, health, volumes, client);
             });
     }
 
@@ -442,11 +650,15 @@ impl PatchbayState {
         self.needs_fit = false;
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn draw_canvas(
         &mut self,
         ui: &mut egui::Ui,
         graph: &GraphSnapshot,
         visible_nodes: &[&NodeSnapshot],
+        config: Option<&Config>,
+        health: &AudioHealthSnapshot,
+        volumes: &BTreeMap<u32, NodeVolumeState>,
         client: &CrimpClient,
     ) {
         let canvas_rect = ui.available_rect_before_wrap();
@@ -521,7 +733,8 @@ impl PatchbayState {
 
         let mut port_screen_pos: HashMap<u32, Pos2> = HashMap::new();
         let mut in_pin_rects: Vec<(u32, u32, Pos2, Rect)> = Vec::new();
-        let mut out_pin_rects: Vec<(u32, u32, Rect)> = Vec::new();
+        let mut out_pin_rects: Vec<(u32, u32, Pos2, Rect)> = Vec::new();
+        let mut mute_btn_rects: Vec<(u32, bool, Rect)> = Vec::new();
         let pointer_pos = ui.input(|i| i.pointer.hover_pos());
         let mut dragging_any_node = false;
         let mut hovering_any_node = false;
@@ -609,10 +822,13 @@ impl PatchbayState {
             }
 
             let title_x = header_rect.left() + 20.0 * self.zoom;
+            let vol_state = volumes.get(&node.id).copied();
+            let metrics = health.per_node.get(&node.id);
+            let title_max_chars = if vol_state.is_some() { 20 } else { 28 };
             painter.text(
                 Pos2::new(title_x, header_rect.top() + 14.0 * self.zoom),
                 Align2::LEFT_CENTER,
-                truncate_label(&node.label, 28),
+                truncate_label(&node.label, title_max_chars),
                 FontId::proportional((13.0 * self.zoom).clamp(9.0, 17.0)),
                 theme::TEXT_PRIMARY,
             );
@@ -629,6 +845,83 @@ impl PatchbayState {
                     theme::TEXT_SUBTLE
                 },
             );
+
+            // Rychlé ztlumení + procenta hlasitosti vpravo v hlavičce karty
+            if let Some(vol) = vol_state
+                && self.zoom >= 0.50
+            {
+                let badge_w = 50.0 * self.zoom;
+                let badge_h = 20.0 * self.zoom;
+                let badge_rect = Rect::from_min_size(
+                    Pos2::new(
+                        header_rect.right() - badge_w - 8.0 * self.zoom,
+                        header_rect.center().y - badge_h * 0.5,
+                    ),
+                    Vec2::new(badge_w, badge_h),
+                );
+                let hovered_mute = pointer_pos.is_some_and(|p| badge_rect.contains(p));
+                let fill = if vol.muted {
+                    Color32::from_rgba_unmultiplied(245, 21, 21, if hovered_mute { 75 } else { 48 })
+                } else if hovered_mute {
+                    theme::SURFACE_HOVER
+                } else {
+                    Color32::from_rgba_unmultiplied(255, 255, 255, 10)
+                };
+                let stroke_col = if vol.muted {
+                    theme::DANGER_RED
+                } else {
+                    theme::BORDER_SUBTLE
+                };
+                painter.rect(
+                    badge_rect,
+                    CornerRadius::same((5.0 * self.zoom).round().clamp(3.0, 7.0) as u8),
+                    fill,
+                    Stroke::new(1.0, stroke_col),
+                    egui::StrokeKind::Inside,
+                );
+                let txt = if vol.muted {
+                    "MUTE".to_string()
+                } else {
+                    format!("{:.0}%", vol.volume * 100.0)
+                };
+                painter.text(
+                    badge_rect.center(),
+                    Align2::CENTER_CENTER,
+                    txt,
+                    FontId::proportional((10.0 * self.zoom).clamp(8.0, 13.0)),
+                    if vol.muted {
+                        theme::DANGER_RED
+                    } else {
+                        theme::TEXT_PRIMARY
+                    },
+                );
+                mute_btn_rects.push((node.id, vol.muted, badge_rect));
+            }
+
+            // Živý VU / aktivní proužek na spodní hraně hlavičky karty (pw-top state + xruns)
+            if let Some(m) = metrics {
+                let bar_h = (2.6 * self.zoom).clamp(1.5, 3.5);
+                let bar_y = header_rect.bottom() - bar_h;
+                let is_muted = vol_state.is_some_and(|v| v.muted);
+                if m.err_count > 0 {
+                    let full_bar = Rect::from_min_max(
+                        Pos2::new(header_rect.left() + 6.0 * self.zoom, bar_y),
+                        Pos2::new(header_rect.right() - 6.0 * self.zoom, header_rect.bottom()),
+                    );
+                    painter.rect_filled(full_bar, CornerRadius::same(1), theme::DANGER_RED);
+                } else if m.state == NodeActivityState::Running && !is_muted {
+                    let frac = (0.24 + m.busy_ratio * 6.5).clamp(0.24, 1.0);
+                    let usable_w = (header_rect.width() - 12.0 * self.zoom).max(4.0);
+                    let active_bar = Rect::from_min_max(
+                        Pos2::new(header_rect.left() + 6.0 * self.zoom, bar_y),
+                        Pos2::new(
+                            header_rect.left() + 6.0 * self.zoom + usable_w * frac,
+                            header_rect.bottom(),
+                        ),
+                    );
+                    painter.rect_filled(active_bar, CornerRadius::same(1), theme::ECONOMY_GREEN);
+                }
+            }
 
             let in_ports = sorted_ports(&node.input_ports);
             let out_ports = sorted_ports(&node.output_ports);
@@ -651,10 +944,14 @@ impl PatchbayState {
                     );
                     in_pin_rects.push((node.id, in_port.id, pin_pos, hit_rect));
 
-                    let pin_hover = self
-                        .dragging_link
-                        .is_some_and(|d| d.output_node_id != node.id)
-                        && pointer_pos.is_some_and(|p| hit_rect.contains(p));
+                    let pin_hover = match self.dragging_link {
+                        None => pointer_pos.is_some_and(|p| hit_rect.contains(p)),
+                        Some(d) => {
+                            d.origin == DragOrigin::Output
+                                && d.node_id != node.id
+                                && pointer_pos.is_some_and(|p| hit_rect.contains(p))
+                        }
+                    };
                     if pin_hover {
                         let glow_rect = Rect::from_min_max(
                             Pos2::new(rect.left() + 4.0 * self.zoom, row_y - half_row + 1.5),
@@ -697,10 +994,16 @@ impl PatchbayState {
                         Pos2::new(pin_pos.x - out_reach, row_y - half_row),
                         Pos2::new(pin_pos.x + 22.0 * self.zoom, row_y + half_row),
                     );
-                    out_pin_rects.push((node.id, out_port.id, hit_rect));
+                    out_pin_rects.push((node.id, out_port.id, pin_pos, hit_rect));
 
-                    let pin_hover = self.dragging_link.is_none()
-                        && pointer_pos.is_some_and(|p| hit_rect.contains(p));
+                    let pin_hover = match self.dragging_link {
+                        None => pointer_pos.is_some_and(|p| hit_rect.contains(p)),
+                        Some(d) => {
+                            d.origin == DragOrigin::Input
+                                && d.node_id != node.id
+                                && pointer_pos.is_some_and(|p| hit_rect.contains(p))
+                        }
+                    };
                     if pin_hover {
                         let glow_rect = Rect::from_min_max(
                             Pos2::new(
@@ -738,11 +1041,29 @@ impl PatchbayState {
             }
         }
 
-        // Tahání nebo kliknutí na Output pin (rozšířený hitbox pokrývá i popisek portu;
-        // na touchpadu stačí 1× kliknout na výstup a pak kliknout na cílový vstup bez držení prstu!)
+        for &(node_id, currently_muted, badge_rect) in &mute_btn_rects {
+            let resp = ui.interact(
+                badge_rect,
+                ui.scope_id().with(("mute_btn", node_id)),
+                Sense::click(),
+            );
+            if resp.clicked() {
+                client.set_node_mute(node_id, !currently_muted);
+            }
+        }
+
+        // Tahání nebo kliknutí z libovolného konce (zelený Output pin i modrý Input pin):
+        // na touchpadu stačí 1× kliknout na jeden pin a pak kliknout na opačný pin bez držení prstu.
         let mut hovering_pin = false;
         let mut started_click_mode_this_frame = false;
-        for &(out_node_id, out_port_id, hit_rect) in &out_pin_rects {
+        let completing_from_input = self
+            .dragging_link
+            .is_some_and(|d| d.is_click_mode && d.origin == DragOrigin::Input);
+        let completing_from_output = self
+            .dragging_link
+            .is_some_and(|d| d.is_click_mode && d.origin == DragOrigin::Output);
+
+        for &(out_node_id, out_port_id, _, hit_rect) in &out_pin_rects {
             let resp = ui.interact(
                 hit_rect,
                 ui.scope_id().with(("out_pin", out_port_id)),
@@ -751,22 +1072,64 @@ impl PatchbayState {
             if resp.hovered() || resp.dragged() {
                 hovering_pin = true;
             }
+            if completing_from_input {
+                continue;
+            }
             if resp.drag_started() {
                 self.dragging_link = Some(PendingDragLink {
-                    output_node_id: out_node_id,
-                    output_port_id: out_port_id,
+                    origin: DragOrigin::Output,
+                    node_id: out_node_id,
+                    port_id: out_port_id,
                     is_click_mode: false,
                 });
             } else if resp.clicked() {
-                let already_selected = self
-                    .dragging_link
-                    .is_some_and(|d| d.is_click_mode && d.output_port_id == out_port_id);
+                let already_selected = self.dragging_link.is_some_and(|d| {
+                    d.is_click_mode && d.origin == DragOrigin::Output && d.port_id == out_port_id
+                });
                 if already_selected {
                     self.dragging_link = None;
                 } else {
                     self.dragging_link = Some(PendingDragLink {
-                        output_node_id: out_node_id,
-                        output_port_id: out_port_id,
+                        origin: DragOrigin::Output,
+                        node_id: out_node_id,
+                        port_id: out_port_id,
+                        is_click_mode: true,
+                    });
+                    started_click_mode_this_frame = true;
+                }
+            }
+        }
+
+        for &(in_node_id, in_port_id, _, hit_rect) in &in_pin_rects {
+            let resp = ui.interact(
+                hit_rect,
+                ui.scope_id().with(("in_pin", in_port_id)),
+                Sense::click_and_drag(),
+            );
+            if resp.hovered() || resp.dragged() {
+                hovering_pin = true;
+            }
+            if completing_from_output {
+                continue;
+            }
+            if resp.drag_started() {
+                self.dragging_link = Some(PendingDragLink {
+                    origin: DragOrigin::Input,
+                    node_id: in_node_id,
+                    port_id: in_port_id,
+                    is_click_mode: false,
+                });
+            } else if resp.clicked() {
+                let already_selected = self.dragging_link.is_some_and(|d| {
+                    d.is_click_mode && d.origin == DragOrigin::Input && d.port_id == in_port_id
+                });
+                if already_selected {
+                    self.dragging_link = None;
+                } else {
+                    self.dragging_link = Some(PendingDragLink {
+                        origin: DragOrigin::Input,
+                        node_id: in_node_id,
+                        port_id: in_port_id,
                         is_click_mode: true,
                     });
                     started_click_mode_this_frame = true;
@@ -775,12 +1138,16 @@ impl PatchbayState {
         }
 
         if let Some(drag) = self.dragging_link
-            && let Some(&out_pos) = port_screen_pos.get(&drag.output_port_id)
+            && let Some(&origin_pos) = port_screen_pos.get(&drag.port_id)
         {
+            let ring_color = match drag.origin {
+                DragOrigin::Output => theme::ECONOMY_GREEN,
+                DragOrigin::Input => theme::ACCENT_BLUE,
+            };
             painter.circle_stroke(
-                out_pos,
+                origin_pos,
                 (PORT_PIN_RADIUS + 4.0) * self.zoom,
-                Stroke::new(2.0, theme::ECONOMY_GREEN),
+                Stroke::new(2.0, ring_color),
             );
         }
 
@@ -822,10 +1189,7 @@ impl PatchbayState {
                 self.selected_node_id = None;
             }
             if secondary_clicked {
-                client.send_command(IpcRequest::DestroyLink {
-                    link_id,
-                    persist: self.persist_topology,
-                });
+                self.record_and_destroy_link(link_id, graph, config, client);
             } else if let Some(link) = graph.links.iter().find(|l| l.id == link_id)
                 && let (Some(&p0), Some(&p3)) = (
                     port_screen_pos.get(&link.output_port_id),
@@ -898,11 +1262,16 @@ impl PatchbayState {
         }
 
         if let Some(drag) = self.dragging_link {
+            let stereo_active = self.stereo_link_mode || ui.input(|i| i.modifiers.shift);
+            let target_pins = match drag.origin {
+                DragOrigin::Output => &in_pin_rects,
+                DragOrigin::Input => &out_pin_rects,
+            };
             let snap_target = pointer_pos.and_then(|ptr| {
-                in_pin_rects
+                target_pins
                     .iter()
-                    .filter(|(in_node_id, _, _, hit)| {
-                        *in_node_id != drag.output_node_id && hit.contains(ptr)
+                    .filter(|(target_node_id, _, _, hit)| {
+                        *target_node_id != drag.node_id && hit.contains(ptr)
                     })
                     .min_by(|(_, _, p_a, _), (_, _, p_b, _)| {
                         p_a.distance_sq(ptr).total_cmp(&p_b.distance_sq(ptr))
@@ -910,52 +1279,110 @@ impl PatchbayState {
                     .copied()
             });
 
-            if let Some(&start) = port_screen_pos.get(&drag.output_port_id)
-                && let Some(end) = snap_target.map(|(_, _, p, _)| p).or(pointer_pos)
-            {
-                draw_cable(&painter, start, end, theme::BG_OBSIDIAN, 4.6);
-                draw_cable(&painter, start, end, theme::ECONOMY_GREEN, 2.5);
+            let mut drew_stereo_preview = false;
+            if stereo_active && let Some((target_node_id, _, _, _)) = snap_target {
+                let (src_id, dst_id) = match drag.origin {
+                    DragOrigin::Output => (drag.node_id, target_node_id),
+                    DragOrigin::Input => (target_node_id, drag.node_id),
+                };
+                if let (Some(src_n), Some(dst_n)) = (
+                    graph.nodes.iter().find(|n| n.id == src_id),
+                    graph.nodes.iter().find(|n| n.id == dst_id),
+                ) {
+                    let pairs = stereo_port_pairs(src_n, dst_n);
+                    for &(_, out_p, _, in_p) in &pairs {
+                        if let (Some(&p0), Some(&p3)) =
+                            (port_screen_pos.get(&out_p), port_screen_pos.get(&in_p))
+                        {
+                            draw_cable(&painter, p0, p3, theme::BG_OBSIDIAN, 4.6);
+                            draw_cable(&painter, p0, p3, theme::ACCENT_BLUE, 2.5);
+                            drew_stereo_preview = true;
+                        }
+                    }
+                }
             }
+
+            if !drew_stereo_preview
+                && let Some(&origin_pos) = port_screen_pos.get(&drag.port_id)
+                && let Some(other_pos) = snap_target.map(|(_, _, p, _)| p).or(pointer_pos)
+            {
+                let (p0, p3, cable_color) = match drag.origin {
+                    DragOrigin::Output => (origin_pos, other_pos, theme::ECONOMY_GREEN),
+                    DragOrigin::Input => (other_pos, origin_pos, theme::ACCENT_BLUE),
+                };
+                draw_cable(&painter, p0, p3, theme::BG_OBSIDIAN, 4.6);
+                draw_cable(&painter, p0, p3, cable_color, 2.5);
+            }
+
+            let mut finish_target: Option<(u32, u32)> = None;
+            let mut cancel_drag = false;
 
             if drag.is_click_mode {
                 if !started_click_mode_this_frame {
                     if primary_clicked {
-                        if let Some((in_node_id, in_port_id, _, _)) = snap_target {
-                            client.send_command(IpcRequest::CreateLink {
-                                output_node_id: drag.output_node_id,
-                                output_port_id: drag.output_port_id,
-                                input_node_id: in_node_id,
-                                input_port_id: in_port_id,
-                                replace_input: true,
-                                persist: self.persist_topology,
-                            });
+                        if let Some((target_node_id, target_port_id, _, _)) = snap_target {
+                            finish_target = Some((target_node_id, target_port_id));
                         }
-                        self.dragging_link = None;
+                        cancel_drag = true;
                     } else if secondary_clicked {
-                        self.dragging_link = None;
+                        cancel_drag = true;
                     }
                 }
             } else if ui.input(|i| i.pointer.any_released()) {
-                if let Some((in_node_id, in_port_id, _, _)) = snap_target {
-                    client.send_command(IpcRequest::CreateLink {
-                        output_node_id: drag.output_node_id,
-                        output_port_id: drag.output_port_id,
-                        input_node_id: in_node_id,
-                        input_port_id: in_port_id,
-                        replace_input: true,
-                        persist: self.persist_topology,
-                    });
+                if let Some((target_node_id, target_port_id, _, _)) = snap_target {
+                    finish_target = Some((target_node_id, target_port_id));
                 }
+                cancel_drag = true;
+            }
+
+            if let Some((target_node_id, target_port_id)) = finish_target {
+                let (output_node_id, output_port_id, input_node_id, input_port_id) =
+                    match drag.origin {
+                        DragOrigin::Output => {
+                            (drag.node_id, drag.port_id, target_node_id, target_port_id)
+                        }
+                        DragOrigin::Input => {
+                            (target_node_id, target_port_id, drag.node_id, drag.port_id)
+                        }
+                    };
+                if stereo_active
+                    && let (Some(src_n), Some(dst_n)) = (
+                        graph.nodes.iter().find(|n| n.id == output_node_id),
+                        graph.nodes.iter().find(|n| n.id == input_node_id),
+                    )
+                {
+                    let pairs = stereo_port_pairs(src_n, dst_n);
+                    if !pairs.is_empty() {
+                        self.record_and_create_links(
+                            format!("Stereo {} -> {}", src_n.label, dst_n.label),
+                            &pairs,
+                            config,
+                            client,
+                        );
+                    }
+                } else {
+                    self.record_and_create_links(
+                        format!("Propojení #{output_node_id} -> #{input_node_id}"),
+                        &[(output_node_id, output_port_id, input_node_id, input_port_id)],
+                        config,
+                        client,
+                    );
+                }
+            }
+            if cancel_drag {
                 self.dragging_link = None;
             }
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn draw_inspector(
         &mut self,
         ui: &mut egui::Ui,
         graph: &GraphSnapshot,
         config: Option<&Config>,
+        health: &AudioHealthSnapshot,
+        volumes: &BTreeMap<u32, NodeVolumeState>,
         client: &CrimpClient,
     ) {
         ui.horizontal(|ui| {
@@ -996,10 +1423,7 @@ impl PatchbayState {
                 }
                 ui.add_space(10.0);
                 if ui.button("Rozpojit tento link").clicked() {
-                    client.send_command(IpcRequest::DestroyLink {
-                        link_id: link.id,
-                        persist: self.persist_topology,
-                    });
+                    self.record_and_destroy_link(link.id, graph, config, client);
                     self.selected_link_id = None;
                 }
                 if let Some(cfg) = config {
@@ -1070,7 +1494,174 @@ impl PatchbayState {
                         ui.label(egui::RichText::new("media.class").color(theme::TEXT_MUTED));
                         ui.label(node.media_class.as_deref().unwrap_or("-"));
                         ui.end_row();
+                        if let Some(m) = health.per_node.get(&node.id) {
+                            ui.label(egui::RichText::new("Signál").color(theme::TEXT_MUTED));
+                            ui.label(
+                                egui::RichText::new(m.state.label_cs()).color(
+                                    if m.state == NodeActivityState::Running {
+                                        theme::ECONOMY_GREEN
+                                    } else {
+                                        theme::TEXT_MUTED
+                                    },
+                                ),
+                            );
+                            ui.end_row();
+                            ui.label(egui::RichText::new("Xruns / DSP").color(theme::TEXT_MUTED));
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "{} xruns · {:.1}%",
+                                    m.err_count,
+                                    m.busy_ratio * 100.0
+                                ))
+                                .color(if m.err_count > 0 {
+                                    theme::DANGER_RED
+                                } else {
+                                    theme::TEXT_PRIMARY
+                                }),
+                            );
+                            ui.end_row();
+                        }
                     });
+
+                // Hlasitost & Ztlumení přímo v inspektoru
+                let is_audio_node = node
+                    .media_class
+                    .as_deref()
+                    .is_some_and(|c| c.contains("Audio"));
+                if is_audio_node || volumes.contains_key(&node.id) {
+                    let cur_vol = volumes.get(&node.id).copied().unwrap_or_default();
+                    ui.add_space(10.0);
+                    ui.label(
+                        egui::RichText::new("Hlasitost & Ztlumení")
+                            .size(12.0)
+                            .color(theme::TEXT_MUTED),
+                    );
+                    ui.horizontal(|ui| {
+                        let mute_btn = if cur_vol.muted {
+                            egui::Button::new(
+                                egui::RichText::new("Ztlumeno").color(Color32::WHITE),
+                            )
+                            .fill(theme::DANGER_RED)
+                            .corner_radius(CornerRadius::same(6))
+                        } else {
+                            egui::Button::new("Ztlumit").corner_radius(CornerRadius::same(6))
+                        };
+                        if ui.add(mute_btn).clicked() {
+                            client.set_node_mute(node.id, !cur_vol.muted);
+                        }
+                        let mut pct = (cur_vol.volume * 100.0).round();
+                        let slider = ui.add(
+                            egui::Slider::new(&mut pct, 0.0..=150.0)
+                                .step_by(1.0)
+                                .suffix("%"),
+                        );
+                        if slider.changed() {
+                            client.set_node_volume(node.id, pct / 100.0);
+                        }
+                    });
+                }
+
+                // Auto DSP profil pro vybranou aplikaci / uzel ([[dsp_profile]])
+                if let Some(cfg) = config {
+                    let matcher = node_to_matcher(node);
+                    let existing_idx = cfg.dsp_profile.iter().position(|p| p.source == matcher);
+                    if self.dsp_for_node_id != Some(node.id) {
+                        self.dsp_for_node_id = Some(node.id);
+                        if let Some(idx) = existing_idx {
+                            self.dsp_quantum_choice = cfg.dsp_profile[idx].quantum;
+                            self.dsp_rate_choice = cfg.dsp_profile[idx].rate;
+                            self.dsp_priority = cfg.dsp_profile[idx].priority;
+                        } else {
+                            self.dsp_quantum_choice = Some(512);
+                            self.dsp_rate_choice = Some(48_000);
+                            self.dsp_priority = 50;
+                        }
+                    }
+
+                    ui.add_space(10.0);
+                    ui.label(
+                        egui::RichText::new("Auto DSP profil (když běží tato aplikace)")
+                            .size(12.0)
+                            .color(theme::TEXT_MUTED),
+                    )
+                    .on_hover_text(
+                        "Po spuštění této aplikace Crimp automaticky přepne buffer / frekvenci a po jejím zavření vrátí globální nastavení.",
+                    );
+                    ui.horizontal(|ui| {
+                        let q_lbl = self
+                            .dsp_quantum_choice
+                            .map_or_else(|| "Auto".into(), |q| format!("{q}"));
+                        egui::ComboBox::from_id_salt(("insp_dsp_q", node.id))
+                            .selected_text(format!("Q: {q_lbl}"))
+                            .width(96.0)
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut self.dsp_quantum_choice, None, "Auto");
+                                for q in [64u32, 128, 256, 512, 1024, 2048] {
+                                    ui.selectable_value(
+                                        &mut self.dsp_quantum_choice,
+                                        Some(q),
+                                        format!("{q}"),
+                                    );
+                                }
+                            });
+                        let r_lbl = self
+                            .dsp_rate_choice
+                            .map_or_else(|| "Auto".into(), |r| format!("{r} Hz"));
+                        egui::ComboBox::from_id_salt(("insp_dsp_r", node.id))
+                            .selected_text(r_lbl)
+                            .width(114.0)
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut self.dsp_rate_choice, None, "Auto");
+                                for r in [44_100u32, 48_000, 88_200, 96_000, 192_000] {
+                                    ui.selectable_value(
+                                        &mut self.dsp_rate_choice,
+                                        Some(r),
+                                        format!("{r} Hz"),
+                                    );
+                                }
+                            });
+                    });
+                    ui.horizontal(|ui| {
+                        if ui.button("Uložit DSP profil").clicked() && !matcher.is_empty() {
+                            let mut next = cfg.clone();
+                            let rule = DspProfileRule {
+                                name: format!("Auto DSP: {}", node.label),
+                                enabled: true,
+                                source: matcher.clone(),
+                                quantum: self.dsp_quantum_choice,
+                                rate: self.dsp_rate_choice,
+                                priority: self.dsp_priority,
+                            };
+                            if let Some(idx) = existing_idx {
+                                next.dsp_profile[idx] = rule;
+                            } else {
+                                next.dsp_profile.push(rule);
+                            }
+                            self.push_undo(UndoEntry {
+                                label: format!("DSP profil pro {}", node.label),
+                                prev_config: Some(cfg.clone()),
+                                next_config: Some(next.clone()),
+                                undo_links: Vec::new(),
+                                redo_links: Vec::new(),
+                            });
+                            client.send_command(IpcRequest::SaveConfig { config: next });
+                        }
+                        if let Some(idx) = existing_idx
+                            && ui.button("Smazat profil").clicked()
+                        {
+                            let mut next = cfg.clone();
+                            next.dsp_profile.remove(idx);
+                            self.push_undo(UndoEntry {
+                                label: format!("Smazání DSP profilu {}", node.label),
+                                prev_config: Some(cfg.clone()),
+                                next_config: Some(next.clone()),
+                                undo_links: Vec::new(),
+                                redo_links: Vec::new(),
+                            });
+                            client.send_command(IpcRequest::SaveConfig { config: next });
+                        }
+                    });
+                }
 
                 if let Some(cfg) = config {
                     ui.add_space(10.0);
@@ -1133,11 +1724,12 @@ impl PatchbayState {
                             .show_ui(ui, |ui| {
                                 for target in targets {
                                     if ui.selectable_label(false, &target.label).clicked() {
-                                        connect_stereo_ports(
-                                            node,
-                                            target,
+                                        let pairs = stereo_port_pairs(node, target);
+                                        self.record_and_create_links(
+                                            format!("Stereo {} -> {}", node.label, target.label),
+                                            &pairs,
+                                            config,
                                             client,
-                                            self.persist_topology,
                                         );
                                     }
                                 }
@@ -1183,6 +1775,32 @@ impl PatchbayState {
                         if node_links.len() > 1 {
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                 if ui.small_button("Odpojit vše").clicked() {
+                                    let undo_links: Vec<UndoLinkOp> = node_links
+                                        .iter()
+                                        .map(|l| UndoLinkOp::Create {
+                                            output_node_id: l.output_node_id,
+                                            output_port_id: l.output_port_id,
+                                            input_node_id: l.input_node_id,
+                                            input_port_id: l.input_port_id,
+                                        })
+                                        .collect();
+                                    let redo_links: Vec<UndoLinkOp> = node_links
+                                        .iter()
+                                        .map(|l| UndoLinkOp::Destroy {
+                                            output_port_id: l.output_port_id,
+                                            input_port_id: l.input_port_id,
+                                        })
+                                        .collect();
+                                    self.push_undo(UndoEntry {
+                                        label: format!("Odpojení všech linek ({})", node.label),
+                                        prev_config: self
+                                            .persist_topology
+                                            .then(|| config.cloned())
+                                            .flatten(),
+                                        next_config: None,
+                                        undo_links,
+                                        redo_links,
+                                    });
                                     for l in &node_links {
                                         client.send_command(IpcRequest::DestroyLink {
                                             link_id: l.id,
@@ -1213,10 +1831,9 @@ impl PatchbayState {
                                         egui::Layout::right_to_left(egui::Align::Center),
                                         |ui| {
                                             if ui.small_button("Odpojit").clicked() {
-                                                client.send_command(IpcRequest::DestroyLink {
-                                                    link_id: l.id,
-                                                    persist: self.persist_topology,
-                                                });
+                                                self.record_and_destroy_link(
+                                                    l.id, graph, config, client,
+                                                );
                                             }
                                         },
                                     );
@@ -1229,7 +1846,7 @@ impl PatchbayState {
             ui.add_space(10.0);
             ui.label(
                 egui::RichText::new(
-                    "Ovládání: Přetažením nebo kliknutím na zelený pin pak na modrý propojíš porty. Do jednoho modrého vstupu lze míchat více zdrojů (ze stejného zdroje se předchozí link nahradí). Pravý klik na drát nebo Delete odpojí a rovnou zapíše [[deny]] do rules.toml. Touchpad: 2 prsty = posun do stran, Ctrl + 2 prsty (nebo +/−) = zoom, kolečko myši = zoom, dvojklik = vycentrovat.",
+                    "Ovládání: Přetažením nebo kliknutím z libovolného konce (zelený ↔ modrý) propojíš porty. Podržením Shift nebo tlačítkem Stereo L+R spojíš oba kanály najednou. Pravý klik na drát nebo Delete odpojí, Ctrl+Z / Ctrl+Y vrací změny zpět. Klik na % / MUTE na kartě rychle ztlumí uzel.",
                 )
                 .color(theme::TEXT_SUBTLE)
                 .size(11.5),
@@ -1238,24 +1855,47 @@ impl PatchbayState {
     }
 }
 
-fn connect_stereo_ports(
-    src: &NodeSnapshot,
-    dst: &NodeSnapshot,
-    client: &CrimpClient,
-    persist: bool,
-) {
+fn stereo_port_pairs(src: &NodeSnapshot, dst: &NodeSnapshot) -> Vec<(u32, u32, u32, u32)> {
     let outs = sorted_ports(&src.output_ports);
     let ins = sorted_ports(&dst.input_ports);
     let pairs = outs.len().min(ins.len());
-    for i in 0..pairs {
-        client.send_command(IpcRequest::CreateLink {
-            output_node_id: src.id,
-            output_port_id: outs[i].id,
-            input_node_id: dst.id,
-            input_port_id: ins[i].id,
-            replace_input: true,
-            persist,
-        });
+    (0..pairs)
+        .map(|i| (src.id, outs[i].id, dst.id, ins[i].id))
+        .collect()
+}
+
+fn apply_undo_link_ops(ops: &[UndoLinkOp], graph: &GraphSnapshot, client: &CrimpClient) {
+    for op in ops {
+        match *op {
+            UndoLinkOp::Create {
+                output_node_id,
+                output_port_id,
+                input_node_id,
+                input_port_id,
+            } => {
+                client.send_command(IpcRequest::CreateLink {
+                    output_node_id,
+                    output_port_id,
+                    input_node_id,
+                    input_port_id,
+                    replace_input: false,
+                    persist: false,
+                });
+            }
+            UndoLinkOp::Destroy {
+                output_port_id,
+                input_port_id,
+            } => {
+                if let Some(link) = graph.links.iter().find(|l| {
+                    l.output_port_id == output_port_id && l.input_port_id == input_port_id
+                }) {
+                    client.send_command(IpcRequest::DestroyLink {
+                        link_id: link.id,
+                        persist: false,
+                    });
+                }
+            }
+        }
     }
 }
 

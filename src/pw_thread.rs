@@ -35,6 +35,7 @@ const HOT_RELOAD_INTERVAL: Duration = Duration::from_millis(1200);
 const IN_FLIGHT_LINK_TTL: Duration = Duration::from_secs(4);
 const RESYNC_COOLDOWN: Duration = Duration::from_millis(450);
 const STARTUP_DEFAULT_WINDOW: Duration = Duration::from_secs(6);
+const PW_FATAL_CORE_ERRNOS: &[i32] = &[-5, -32, -104, -107, -108];
 
 #[derive(Debug, Error)]
 pub enum PwError {
@@ -816,6 +817,19 @@ impl DaemonState {
             return Err("Cílový port v PipeWire grafu neexistuje".to_string());
         };
 
+        if output_node_id == input_node_id {
+            return Err("Nelze propojit uzel sám se sebou".to_string());
+        }
+        if out_port.node_id != output_node_id || in_port.node_id != input_node_id {
+            return Err("Vybraný port nepatří k odpovídajícímu uzlu".to_string());
+        }
+        if out_port.direction != PortDirection::Output || in_port.direction != PortDirection::Input
+        {
+            return Err(
+                "Lze propojit pouze výstupní (zelený) port se vstupním (modrým) portem".to_string(),
+            );
+        }
+
         if !persist
             && let Some(rule) = self.engine.find_deny_for_endpoints(
                 Some(&out_node),
@@ -865,6 +879,33 @@ impl DaemonState {
             }
         }
 
+        let link_already_exists = self
+            .graph
+            .find_link_between_ports(output_port_id, input_port_id)
+            .is_some();
+
+        if !link_already_exists {
+            let link_factory = self
+                .link_factory
+                .clone()
+                .unwrap_or_else(|| "link-factory".to_string());
+
+            let props = properties! {
+                "link.output.node" => output_node_id.to_string(),
+                "link.output.port" => output_port_id.to_string(),
+                "link.input.node" => input_node_id.to_string(),
+                "link.input.port" => input_port_id.to_string(),
+                "object.linger" => "1"
+            };
+
+            self.core
+                .create_object::<Link>(&link_factory, &props)
+                .map_err(|e| format!("PipeWire odmítl vytvořit link: {e}"))?;
+
+            self.in_flight_links
+                .insert((output_port_id, input_port_id), Instant::now());
+        }
+
         if let Some(mut cfg) = next_cfg {
             let changed = record_manual_connect(&mut cfg, &out_node, &out_port, &in_node, &in_port);
             if changed || replaced_count > 0 {
@@ -872,11 +913,7 @@ impl DaemonState {
             }
         }
 
-        if self
-            .graph
-            .find_link_between_ports(output_port_id, input_port_id)
-            .is_some()
-        {
+        if link_already_exists {
             return Ok(if persist {
                 "Spojení zachováno a uloženo do rules.toml".to_string()
             } else if replaced_count > 0 {
@@ -886,25 +923,6 @@ impl DaemonState {
             });
         }
 
-        let link_factory = self
-            .link_factory
-            .clone()
-            .unwrap_or_else(|| "link-factory".to_string());
-
-        let props = properties! {
-            "link.output.node" => output_node_id.to_string(),
-            "link.output.port" => output_port_id.to_string(),
-            "link.input.node" => input_node_id.to_string(),
-            "link.input.port" => input_port_id.to_string(),
-            "object.linger" => "1"
-        };
-
-        self.core
-            .create_object::<Link>(&link_factory, &props)
-            .map_err(|e| format!("PipeWire odmítl vytvořit link: {e}"))?;
-
-        self.in_flight_links
-            .insert((output_port_id, input_port_id), Instant::now());
         info!(
             output_node_id,
             output_port_id,
@@ -1739,11 +1757,19 @@ fn run_single_pipewire_session(
                     .collect();
             }
         })
-        .error(move |id, _seq, res, message| {
-            if id == pw::core::PW_ID_CORE {
+        .error(move |id, seq, res, message| {
+            if id == pw::core::PW_ID_CORE && PW_FATAL_CORE_ERRNOS.contains(&res) {
                 warn!(res, message, "PipeWire Core ohlásil fatální chybu spojení");
                 disconnect_core.set(true);
                 mainloop_err.quit();
+            } else {
+                warn!(
+                    id,
+                    seq,
+                    res,
+                    message,
+                    "PipeWire vrátil nefatální chybu operace (spojení zůstává aktivní)"
+                );
             }
         })
         .register();
