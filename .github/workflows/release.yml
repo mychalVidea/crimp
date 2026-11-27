@@ -79,6 +79,7 @@ jobs:
           echo "version=${NEXT_VER}" >> "$GITHUB_OUTPUT"
           echo "Base Cargo.toml=${BASE_VER}, Prev release=${PREV_VER:-none} (${PREV_COMMIT:-none}), Next=${NEXT_VER} (${SHORT_SHA})"
           if [ "${NEXT_VER}" != "${BASE_VER}" ]; then
+            cargo fetch --locked
             sed -i -E "s/^version = \"[^\"]+\"/version = \"${NEXT_VER}\"/" Cargo.toml
             cargo update --workspace --offline
           fi
