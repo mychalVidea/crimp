@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 pub const CRIMP_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -261,9 +261,65 @@ fn parse_semver(raw: &str) -> Option<(u64, u64, u64)> {
     Some((major, minor, patch))
 }
 
+/// Na Linuxu kernel k `/proc/self/exe` připojí ` (deleted)` poté, co `install.sh` / balíčkovač
+/// nahradí běžící binárku na disku novou verzí. Tato funkce příponu bezpečně ořeže.
+#[must_use]
+pub fn strip_linux_deleted_suffix(path: &Path) -> PathBuf {
+    match path.to_str() {
+        Some(s) => PathBuf::from(s.strip_suffix(" (deleted)").unwrap_or(s)),
+        None => path.to_path_buf(),
+    }
+}
+
+/// Najde aktuální spustitelnou binárku (`crimp` nebo `crimp-ui`) i tehdy, když původní proces
+/// ještě běží ze smazaného inodu po samo-aktualizaci (`/proc/self/exe -> ... (deleted)`).
+#[must_use]
+pub fn resolve_live_binary(bin_name: &str) -> PathBuf {
+    if let Ok(exe) = std::env::current_exe() {
+        let clean = strip_linux_deleted_suffix(&exe);
+        if clean.file_name().and_then(|n| n.to_str()) == Some(bin_name) && clean.is_file() {
+            return clean;
+        }
+        if let Some(candidate) = clean.parent().map(|d| d.join(bin_name))
+            && candidate.is_file()
+        {
+            return candidate;
+        }
+    }
+
+    let mut candidates = Vec::new();
+    if let Some(dir) = dirs::executable_dir() {
+        candidates.push(dir.join(bin_name));
+    }
+    if let Some(home) = dirs::home_dir() {
+        candidates.push(home.join(".local/bin").join(bin_name));
+    }
+    candidates.push(PathBuf::from("/usr/local/bin").join(bin_name));
+    candidates.push(PathBuf::from("/usr/bin").join(bin_name));
+
+    for cand in candidates {
+        if cand.is_file() {
+            return cand;
+        }
+    }
+
+    PathBuf::from(bin_name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strips_deleted_suffix_from_updated_linux_exe() {
+        let deleted = Path::new("/home/user/.local/bin/crimp-ui (deleted)");
+        assert_eq!(
+            strip_linux_deleted_suffix(deleted),
+            PathBuf::from("/home/user/.local/bin/crimp-ui")
+        );
+        let normal = Path::new("/usr/bin/crimp-ui");
+        assert_eq!(strip_linux_deleted_suffix(normal), normal);
+    }
 
     #[test]
     fn compares_semver_and_commit_accurately() {

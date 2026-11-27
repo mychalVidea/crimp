@@ -199,6 +199,7 @@ impl eframe::App for CrimpGuiApp {
                                 .clicked()
                             {
                                 self.restarting = true;
+                                self._wake_guard.disarm_cleanup();
                                 self.patchbay.flush_saved_layout(snap.graph.as_ref());
                                 match self.client.restart_gui_process() {
                                     Ok(()) => {
@@ -351,7 +352,9 @@ impl eframe::App for CrimpGuiApp {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         let snap = self.client.snapshot();
         self.patchbay.flush_saved_layout(snap.graph.as_ref());
-        tray::cleanup_window_socket();
+        if !self.restarting {
+            tray::cleanup_window_socket();
+        }
     }
 }
 

@@ -117,13 +117,7 @@ fn main() -> ExitCode {
 }
 
 fn launch_gui() -> ExitCode {
-    let sibling = env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.join("crimp-ui")));
-
-    let binary = sibling
-        .filter(|p| p.exists())
-        .unwrap_or_else(|| PathBuf::from("crimp-ui"));
+    let binary = update::resolve_live_binary("crimp-ui");
 
     match Command::new(&binary).spawn() {
         Ok(_) => ExitCode::SUCCESS,

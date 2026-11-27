@@ -46,18 +46,16 @@ pub fn ensure_tray_running() {
     if send_line(&tray_socket_path(), "ping") {
         return;
     }
-    if let Ok(exe) = std::env::current_exe() {
-        let _ = Command::new(exe).arg("--tray").spawn();
-    }
+    let exe = crimp_proto::update::resolve_live_binary("crimp-ui");
+    let _ = Command::new(exe).arg("--tray").spawn();
 }
 
 /// Restartuje běžící tray proces (např. po auto-updatu na novou binárku).
 pub fn restart_tray_if_running() {
     if send_line(&tray_socket_path(), "quit") {
         thread::sleep(Duration::from_millis(120));
-        if let Ok(exe) = std::env::current_exe() {
-            let _ = Command::new(exe).arg("--tray").spawn();
-        }
+        let exe = crimp_proto::update::resolve_live_binary("crimp-ui");
+        let _ = Command::new(exe).arg("--tray").spawn();
     }
 }
 
@@ -69,11 +67,21 @@ pub fn cleanup_window_socket() {
 /// Spustí posluchač okna pro příkazy `show` (zaměření) a `quit` (ukončení z tray menu).
 pub struct WindowWakeGuard {
     sock_path: PathBuf,
+    cleanup_on_drop: AtomicBool,
+}
+
+impl WindowWakeGuard {
+    /// Při restartu UI zakáže starému oknu smazat `crimp-ui.sock` nové instance.
+    pub fn disarm_cleanup(&self) {
+        self.cleanup_on_drop.store(false, Ordering::SeqCst);
+    }
 }
 
 impl Drop for WindowWakeGuard {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.sock_path);
+        if self.cleanup_on_drop.load(Ordering::SeqCst) {
+            let _ = fs::remove_file(&self.sock_path);
+        }
     }
 }
 
@@ -113,7 +121,10 @@ pub fn spawn_window_wake_listener(
                 }
             });
     }
-    WindowWakeGuard { sock_path }
+    WindowWakeGuard {
+        sock_path,
+        cleanup_on_drop: AtomicBool::new(true),
+    }
 }
 
 /// Samostatná lehká tray smyčka (`crimp-ui --tray`), bez OpenGL okna a bez Wayland `set_visible` bugu.
@@ -168,9 +179,8 @@ fn open_or_focus_window() {
     if try_focus_existing_window() {
         return;
     }
-    if let Ok(exe) = std::env::current_exe() {
-        let _ = Command::new(exe).arg("--window").spawn();
-    }
+    let exe = crimp_proto::update::resolve_live_binary("crimp-ui");
+    let _ = Command::new(exe).arg("--window").spawn();
 }
 
 struct CrimpTray {

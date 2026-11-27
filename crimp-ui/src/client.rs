@@ -321,13 +321,7 @@ impl CrimpClient {
     }
 
     pub fn spawn_background_daemon(&self) -> Result<(), String> {
-        let sibling = std::env::current_exe()
-            .ok()
-            .and_then(|p| p.parent().map(|d| d.join("crimp")));
-        let binary = sibling
-            .filter(|p| p.exists())
-            .unwrap_or_else(|| PathBuf::from("crimp"));
-
+        let binary = update::resolve_live_binary("crimp");
         Command::new(&binary)
             .arg("daemon")
             .spawn()
@@ -338,12 +332,12 @@ impl CrimpClient {
     pub fn restart_gui_process(&self) -> Result<(), String> {
         tray::cleanup_window_socket();
         tray::restart_tray_if_running();
-        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-        Command::new(exe)
+        let exe = update::resolve_live_binary("crimp-ui");
+        Command::new(&exe)
             .arg("--new-window")
             .spawn()
             .map(|_| ())
-            .map_err(|e| format!("Nelze znovu spustit UI: {e}"))
+            .map_err(|e| format!("Nelze znovu spustit UI ({}): {e}", exe.display()))
     }
 }
 

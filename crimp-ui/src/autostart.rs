@@ -43,9 +43,14 @@ pub fn set_autostart(enable: bool) -> Result<String, String> {
         .ok_or_else(|| "Nelze určit cestu k ~/.config/autostart".to_string())?;
 
     if enable {
-        let ui_exe = std::env::current_exe()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|_| "crimp-ui".to_string());
+        let raw_exe = crimp_proto::update::resolve_live_binary("crimp-ui")
+            .display()
+            .to_string();
+        let ui_exe = if raw_exe.contains(' ') {
+            format!("\"{raw_exe}\"")
+        } else {
+            raw_exe
+        };
 
         if let Some(parent) = desktop_path.parent() {
             fs::create_dir_all(parent).map_err(|e| format!("Chyba vytvoření autostartu: {e}"))?;
