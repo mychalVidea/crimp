@@ -274,6 +274,123 @@ impl Config {
 
         Ok(())
     }
+
+    /// Promítne ruční změnu PipeWire metadata/DSP do konfigurace tak, aby přežila restart PC.
+    /// Vrací `Ok(true)`, pokud se změnila alespoň jedna perzistentní položka konfigurace.
+    pub fn apply_metadata_override(
+        &mut self,
+        key: &str,
+        value: Option<&str>,
+    ) -> Result<bool, String> {
+        let clean = value.map(str::trim).filter(|s| !s.is_empty());
+        let mut next = self.clone();
+
+        match key.trim() {
+            "clock.force-quantum" => {
+                next.dsp.default_quantum = match clean {
+                    None | Some("0") => None,
+                    Some(v) => Some(
+                        v.parse::<u32>()
+                            .map_err(|_| format!("Neplatná hodnota clock.force-quantum '{v}'"))?,
+                    ),
+                };
+            }
+            "clock.force-rate" => {
+                next.dsp.default_rate = match clean {
+                    None | Some("0") => None,
+                    Some(v) => Some(
+                        v.parse::<u32>()
+                            .map_err(|_| format!("Neplatná hodnota clock.force-rate '{v}'"))?,
+                    ),
+                };
+            }
+            "clock.min-quantum" => {
+                next.pw_settings.min_quantum = parse_opt_pw_u32("clock.min-quantum", clean)?;
+            }
+            "clock.max-quantum" => {
+                next.pw_settings.max_quantum = parse_opt_pw_u32("clock.max-quantum", clean)?;
+            }
+            "clock.quantum-limit" => {
+                next.pw_settings.quantum_limit = parse_opt_pw_u32("clock.quantum-limit", clean)?;
+            }
+            "clock.quantum-floor" => {
+                next.pw_settings.quantum_floor = parse_opt_pw_u32("clock.quantum-floor", clean)?;
+            }
+            "clock.allowed-rates" => {
+                next.pw_settings.allowed_rates = match clean {
+                    None => None,
+                    Some(v) => Some(parse_allowed_rates_list(v)?),
+                };
+            }
+            "clock.power-of-two-quantum" => {
+                next.pw_settings.power_of_two_quantum = match clean {
+                    None => None,
+                    Some("true" | "1") => Some(true),
+                    Some("false" | "0") => Some(false),
+                    Some(other) => {
+                        return Err(format!(
+                            "Neplatná booleovská hodnota pro '{key}': '{other}' (očekáváno true/false)"
+                        ));
+                    }
+                };
+            }
+            "log.level" => {
+                next.pw_settings.log_level = match clean {
+                    None => None,
+                    Some(v) => Some(
+                        v.parse::<u8>()
+                            .map_err(|_| format!("Neplatná hodnota log.level '{v}'"))?,
+                    ),
+                };
+            }
+            "default.audio.sink" | "default.configured.audio.sink" => {
+                next.pw_settings.default_audio_sink =
+                    crate::graph::PwRuntimeState::extract_device_name(clean);
+            }
+            "default.audio.source" | "default.configured.audio.source" => {
+                next.pw_settings.default_audio_source =
+                    crate::graph::PwRuntimeState::extract_device_name(clean);
+            }
+            _ => return Ok(false),
+        }
+
+        next.validate().map_err(|e| e.to_string())?;
+        if &next == self {
+            return Ok(false);
+        }
+        *self = next;
+        Ok(true)
+    }
+}
+
+/// Zparsuje seznam vzorkovacích frekvencí z formátu PipeWire (`[ 44100 48000 96000 ]` nebo `44100, 48000`).
+pub fn parse_allowed_rates_list(raw: &str) -> Result<Vec<u32>, String> {
+    let inner = raw.trim().trim_start_matches('[').trim_end_matches(']');
+    let mut rates = Vec::new();
+    for token in inner.split(|c: char| c.is_whitespace() || c == ',' || c == ';') {
+        let t = token.trim();
+        if t.is_empty() {
+            continue;
+        }
+        let val = t
+            .parse::<u32>()
+            .map_err(|_| format!("Neplatná vzorkovací frekvence '{t}' v allowed-rates"))?;
+        rates.push(val);
+    }
+    if rates.is_empty() {
+        return Err("Seznam clock.allowed-rates nesmí být prázdný".to_string());
+    }
+    Ok(rates)
+}
+
+fn parse_opt_pw_u32(key: &str, clean: Option<&str>) -> Result<Option<u32>, String> {
+    match clean {
+        None => Ok(None),
+        Some(v) => v
+            .parse::<u32>()
+            .map(Some)
+            .map_err(|_| format!("Neplatné číslo pro {key}: '{v}'")),
+    }
 }
 
 fn validate_opt_quantum(rule: &str, quantum: Option<u32>) -> Result<(), ConfigError> {
@@ -526,5 +643,36 @@ mod tests {
         let cfg: Config = toml::from_str(sample).expect("parses");
         let err = cfg.validate().expect_err("min > max must fail");
         assert!(matches!(err, ConfigError::Validation { .. }));
+    }
+
+    #[test]
+    fn persists_live_metadata_and_dsp_into_config() {
+        let mut cfg = Config::default();
+        assert!(
+            cfg.apply_metadata_override("clock.force-quantum", Some("256"))
+                .expect("quantum")
+        );
+        assert!(
+            cfg.apply_metadata_override("clock.force-rate", Some("96000"))
+                .expect("rate")
+        );
+        assert!(
+            cfg.apply_metadata_override("clock.allowed-rates", Some("[ 44100 48000 96000 ]"))
+                .expect("allowed-rates")
+        );
+        assert!(
+            cfg.apply_metadata_override("default.audio.sink", Some(r#"{"name":"alsa_test"}"#))
+                .expect("default sink")
+        );
+        assert_eq!(cfg.dsp.default_quantum, Some(256));
+        assert_eq!(cfg.dsp.default_rate, Some(96000));
+        assert_eq!(
+            cfg.pw_settings.allowed_rates.as_deref(),
+            Some(&[44100, 48000, 96000][..])
+        );
+        assert_eq!(
+            cfg.pw_settings.default_audio_sink.as_deref(),
+            Some("alsa_test")
+        );
     }
 }

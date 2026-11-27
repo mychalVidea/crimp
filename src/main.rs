@@ -480,20 +480,24 @@ fn run_daemon(custom_config: Option<PathBuf>, custom_socket: Option<String>) -> 
                 input_node_id,
                 input_port_id,
                 replace_input,
+                persist,
             } => match pw_for_ipc.create_manual_link(
                 output_node_id,
                 output_port_id,
                 input_node_id,
                 input_port_id,
                 replace_input,
+                persist,
             ) {
                 Ok(message) => IpcResponse::Ok { message },
                 Err(message) => IpcResponse::Error { message },
             },
-            IpcRequest::DestroyLink { link_id } => match pw_for_ipc.destroy_manual_link(link_id) {
-                Ok(message) => IpcResponse::Ok { message },
-                Err(message) => IpcResponse::Error { message },
-            },
+            IpcRequest::DestroyLink { link_id, persist } => {
+                match pw_for_ipc.destroy_manual_link(link_id, persist) {
+                    Ok(message) => IpcResponse::Ok { message },
+                    Err(message) => IpcResponse::Error { message },
+                }
+            }
             IpcRequest::Shutdown => {
                 let _ = pw_for_ipc.send_command(PwCommand::Shutdown);
                 IpcResponse::Ok {

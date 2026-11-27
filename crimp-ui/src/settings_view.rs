@@ -161,13 +161,13 @@ impl SettingsViewState {
             // 1. Horní bento řada: Živý stav + Rychlé DSP přepínače vedle sebe (při užším okně pod sebou)
             if full_w >= 860.0 {
                 ui.columns(2, |cols| {
-                    draw_live_status_card(&mut cols[0], status, runtime);
-                    draw_dsp_card(&mut cols[1], status, client);
+                    draw_live_status_card(&mut cols[0], status, runtime, config);
+                    draw_dsp_card(&mut cols[1], status, config, client);
                 });
             } else {
-                draw_live_status_card(ui, status, runtime);
+                draw_live_status_card(ui, status, runtime, config);
                 ui.add_space(12.0);
-                draw_dsp_card(ui, status, client);
+                draw_dsp_card(ui, status, config, client);
             }
 
             ui.add_space(12.0);
@@ -344,6 +344,12 @@ impl SettingsViewState {
                         next.pw_settings.max_quantum = self.max_quantum_input.trim().parse().ok();
                         next.pw_settings.quantum_limit =
                             self.quantum_limit_input.trim().parse().ok();
+                        let rates_raw = self.allowed_rates_input.trim();
+                        next.pw_settings.allowed_rates = if rates_raw.is_empty() {
+                            None
+                        } else {
+                            crimp_proto::config::parse_allowed_rates_list(rates_raw).ok()
+                        };
                         client.send_command(IpcRequest::SaveConfig { config: next });
                     }
                 });
@@ -424,6 +430,7 @@ fn draw_live_status_card(
     ui: &mut egui::Ui,
     status: Option<&DaemonStatus>,
     runtime: Option<&PwRuntimeState>,
+    config: Option<&Config>,
 ) {
     theme::wide_card(ui, |ui| {
         theme::section_label(ui, "PipeWire Server & Živý Stav");
@@ -455,9 +462,15 @@ fn draw_live_status_card(
             );
             let active_rate =
                 format_pw_value(rt.clock_force_rate.as_deref(), rt.clock_rate.as_deref());
+            let saved_pref = config
+                .is_some_and(|c| c.dsp.default_quantum.is_some() || c.dsp.default_rate.is_some());
             let profile = status
                 .and_then(|s| s.dsp_active_profile.as_deref())
-                .unwrap_or("výchozí / auto");
+                .unwrap_or(if saved_pref {
+                    "uložená preference (rules.toml)"
+                } else {
+                    "výchozí / auto"
+                });
             let sink = rt.default_audio_sink.as_deref().unwrap_or("-");
 
             ui.columns(2, |cols| {
@@ -515,13 +528,25 @@ fn draw_live_status_card(
     });
 }
 
-fn draw_dsp_card(ui: &mut egui::Ui, status: Option<&DaemonStatus>, client: &CrimpClient) {
+fn draw_dsp_card(
+    ui: &mut egui::Ui,
+    status: Option<&DaemonStatus>,
+    config: Option<&Config>,
+    client: &CrimpClient,
+) {
+    let selected_quantum = status
+        .and_then(|s| s.manual_quantum_override)
+        .or_else(|| config.and_then(|c| c.dsp.default_quantum));
+    let selected_rate = status
+        .and_then(|s| s.manual_rate_override)
+        .or_else(|| config.and_then(|c| c.dsp.default_rate));
+
     theme::wide_card(ui, |ui| {
         theme::section_label(ui, "Živé DSP Přepínače (Buffer / Sample Rate)");
         ui.add_space(6.0);
         ui.label(
             egui::RichText::new(
-                "Najeď myší na libovolný prvek pro vysvětlení. Změny se projeví okamžitě bez restartu her ani programů.",
+                "Projeví se okamžitě v PipeWire bez restartu aplikací a rovnou se uloží do rules.toml (načtou se při každém startu PC).",
             )
             .size(12.0)
             .color(theme::TEXT_MUTED),
@@ -546,7 +571,7 @@ fn draw_dsp_card(ui: &mut egui::Ui, status: Option<&DaemonStatus>, client: &Crim
                 (1024, "Úsporný buffer (~21.3 ms @ 48k)"),
                 (2048, "Maximální stabilita při extrémní zátěži"),
             ] {
-                let active = status.and_then(|s| s.manual_quantum_override) == Some(q);
+                let active = selected_quantum == Some(q);
                 if ui
                     .selectable_label(active, format!("{q}"))
                     .on_hover_text(hint)
@@ -559,10 +584,7 @@ fn draw_dsp_card(ui: &mut egui::Ui, status: Option<&DaemonStatus>, client: &Crim
                 }
             }
             if ui
-                .selectable_label(
-                    status.is_some_and(|s| s.manual_quantum_override.is_none()),
-                    "Auto",
-                )
+                .selectable_label(selected_quantum.is_none(), "Auto")
                 .on_hover_text("Vrátí řízení velikosti bufferu zpět PipeWire/aplikacím")
                 .clicked()
             {
@@ -585,7 +607,7 @@ fn draw_dsp_card(ui: &mut egui::Ui, status: Option<&DaemonStatus>, client: &Crim
         ui.add_space(4.0);
         ui.horizontal_wrapped(|ui| {
             for r in [44100u32, 48000, 88200, 96000, 192000] {
-                let active = status.and_then(|s| s.manual_rate_override) == Some(r);
+                let active = selected_rate == Some(r);
                 if ui.selectable_label(active, format!("{r} Hz")).clicked() {
                     client.send_command(IpcRequest::SetDsp {
                         quantum: DspOverrideChange::Keep,
@@ -594,10 +616,7 @@ fn draw_dsp_card(ui: &mut egui::Ui, status: Option<&DaemonStatus>, client: &Crim
                 }
             }
             if ui
-                .selectable_label(
-                    status.is_some_and(|s| s.manual_rate_override.is_none()),
-                    "Auto",
-                )
+                .selectable_label(selected_rate.is_none(), "Auto")
                 .on_hover_text("Nechá PipeWire vybrat frekvenci automaticky podle zdroje zvuku")
                 .clicked()
             {

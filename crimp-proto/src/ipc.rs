@@ -74,9 +74,13 @@ pub enum IpcRequest {
         input_port_id: u32,
         #[serde(default = "default_true")]
         replace_input: bool,
+        #[serde(default = "default_true")]
+        persist: bool,
     },
     DestroyLink {
         link_id: u32,
+        #[serde(default = "default_true")]
+        persist: bool,
     },
     Shutdown,
 }

@@ -34,6 +34,7 @@ pub struct PatchbayState {
     needs_fit: bool,
     hide_internal_and_midi: bool,
     scroll_mode: ScrollMode,
+    persist_topology: bool,
     last_wheel_was_point: bool,
     pending_zoom_step: Option<f32>,
     layout_dirty_since: Option<Instant>,
@@ -53,6 +54,7 @@ impl Default for PatchbayState {
         let zoom = saved.zoom.clamp(ZOOM_MIN, ZOOM_MAX);
         let hide_internal_and_midi = saved.hide_internal_and_midi;
         let scroll_mode = saved.scroll_mode;
+        let persist_topology = saved.persist_topology;
         Self {
             positions: HashMap::new(),
             saved,
@@ -61,6 +63,7 @@ impl Default for PatchbayState {
             needs_fit: !has_saved_positions,
             hide_internal_and_midi,
             scroll_mode,
+            persist_topology,
             last_wheel_was_point: true,
             pending_zoom_step: None,
             layout_dirty_since: None,
@@ -92,6 +95,7 @@ impl PatchbayState {
         self.saved.zoom = self.zoom;
         self.saved.hide_internal_and_midi = self.hide_internal_and_midi;
         self.saved.scroll_mode = self.scroll_mode;
+        self.saved.persist_topology = self.persist_topology;
         save_layout(&self.saved);
         self.layout_dirty_since = None;
     }
@@ -104,6 +108,7 @@ impl PatchbayState {
         self.zoom = self.saved.zoom.clamp(ZOOM_MIN, ZOOM_MAX);
         self.hide_internal_and_midi = self.saved.hide_internal_and_midi;
         self.scroll_mode = self.saved.scroll_mode;
+        self.persist_topology = self.saved.persist_topology;
         self.needs_fit = self.saved.node_positions.is_empty();
         self.layout_dirty_since = None;
     }
@@ -163,7 +168,10 @@ impl PatchbayState {
                     i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace)
                 })
             {
-                client.send_command(IpcRequest::DestroyLink { link_id });
+                client.send_command(IpcRequest::DestroyLink {
+                    link_id,
+                    persist: self.persist_topology,
+                });
                 self.selected_link_id = None;
             }
             if ui.input(|i| i.key_pressed(egui::Key::F) || i.key_pressed(egui::Key::Num0)) {
@@ -218,6 +226,15 @@ impl PatchbayState {
                 )
                 .on_hover_text(
                     "Skryje interní PipeWire drivery a prázdné MIDI mosty pro přehlednější graf",
+                )
+                .changed()
+            {
+                self.mark_dirty();
+            }
+            if ui
+                .checkbox(&mut self.persist_topology, "Pamatovat odpojení")
+                .on_hover_text(
+                    "Když je zapnuto, každé rozpojení drátu uloží trvalé [[deny]] pravidlo (WirePlumber ho po restartu PC ani aplikací znovu nepřipojí) a každé zapojení uloží neexkluzivní [[route]] do rules.toml.",
                 )
                 .changed()
             {
@@ -805,7 +822,10 @@ impl PatchbayState {
                 self.selected_node_id = None;
             }
             if secondary_clicked {
-                client.send_command(IpcRequest::DestroyLink { link_id });
+                client.send_command(IpcRequest::DestroyLink {
+                    link_id,
+                    persist: self.persist_topology,
+                });
             } else if let Some(link) = graph.links.iter().find(|l| l.id == link_id)
                 && let (Some(&p0), Some(&p3)) = (
                     port_screen_pos.get(&link.output_port_id),
@@ -907,6 +927,7 @@ impl PatchbayState {
                                 input_node_id: in_node_id,
                                 input_port_id: in_port_id,
                                 replace_input: true,
+                                persist: self.persist_topology,
                             });
                         }
                         self.dragging_link = None;
@@ -922,6 +943,7 @@ impl PatchbayState {
                         input_node_id: in_node_id,
                         input_port_id: in_port_id,
                         replace_input: true,
+                        persist: self.persist_topology,
                     });
                 }
                 self.dragging_link = None;
@@ -974,7 +996,10 @@ impl PatchbayState {
                 }
                 ui.add_space(10.0);
                 if ui.button("Rozpojit tento link").clicked() {
-                    client.send_command(IpcRequest::DestroyLink { link_id: link.id });
+                    client.send_command(IpcRequest::DestroyLink {
+                        link_id: link.id,
+                        persist: self.persist_topology,
+                    });
                     self.selected_link_id = None;
                 }
                 if let Some(cfg) = config {
@@ -1108,7 +1133,12 @@ impl PatchbayState {
                             .show_ui(ui, |ui| {
                                 for target in targets {
                                     if ui.selectable_label(false, &target.label).clicked() {
-                                        connect_stereo_ports(node, target, client);
+                                        connect_stereo_ports(
+                                            node,
+                                            target,
+                                            client,
+                                            self.persist_topology,
+                                        );
                                     }
                                 }
                             });
@@ -1154,7 +1184,10 @@ impl PatchbayState {
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                 if ui.small_button("Odpojit vše").clicked() {
                                     for l in &node_links {
-                                        client.send_command(IpcRequest::DestroyLink { link_id: l.id });
+                                        client.send_command(IpcRequest::DestroyLink {
+                                            link_id: l.id,
+                                            persist: self.persist_topology,
+                                        });
                                     }
                                 }
                             });
@@ -1182,6 +1215,7 @@ impl PatchbayState {
                                             if ui.small_button("Odpojit").clicked() {
                                                 client.send_command(IpcRequest::DestroyLink {
                                                     link_id: l.id,
+                                                    persist: self.persist_topology,
                                                 });
                                             }
                                         },
@@ -1195,7 +1229,7 @@ impl PatchbayState {
             ui.add_space(10.0);
             ui.label(
                 egui::RichText::new(
-                    "Ovládání: Přetažením nebo kliknutím na zelený pin pak na modrý propojíš porty. Do jednoho modrého vstupu lze míchat více zdrojů (ze stejného zdroje se předchozí link nahradí). Pravý klik na drát nebo Delete odpojí. Touchpad: 2 prsty = posun do stran, Ctrl + 2 prsty (nebo +/−) = zoom, kolečko myši = zoom, dvojklik = vycentrovat.",
+                    "Ovládání: Přetažením nebo kliknutím na zelený pin pak na modrý propojíš porty. Do jednoho modrého vstupu lze míchat více zdrojů (ze stejného zdroje se předchozí link nahradí). Pravý klik na drát nebo Delete odpojí a rovnou zapíše [[deny]] do rules.toml. Touchpad: 2 prsty = posun do stran, Ctrl + 2 prsty (nebo +/−) = zoom, kolečko myši = zoom, dvojklik = vycentrovat.",
                 )
                 .color(theme::TEXT_SUBTLE)
                 .size(11.5),
@@ -1204,7 +1238,12 @@ impl PatchbayState {
     }
 }
 
-fn connect_stereo_ports(src: &NodeSnapshot, dst: &NodeSnapshot, client: &CrimpClient) {
+fn connect_stereo_ports(
+    src: &NodeSnapshot,
+    dst: &NodeSnapshot,
+    client: &CrimpClient,
+    persist: bool,
+) {
     let outs = sorted_ports(&src.output_ports);
     let ins = sorted_ports(&dst.input_ports);
     let pairs = outs.len().min(ins.len());
@@ -1215,6 +1254,7 @@ fn connect_stereo_ports(src: &NodeSnapshot, dst: &NodeSnapshot, client: &CrimpCl
             input_node_id: dst.id,
             input_port_id: ins[i].id,
             replace_input: true,
+            persist,
         });
     }
 }

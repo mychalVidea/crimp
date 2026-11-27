@@ -4,7 +4,10 @@ use crimp_proto::graph::{
     PwRuntimeState,
 };
 use crimp_proto::ipc::{DaemonStatus, DefaultDeviceKind, DspOverrideChange, MetadataTarget};
-use crimp_proto::rules::{DenyAction, DspTarget, RouteAction, RuleEngine};
+use crimp_proto::rules::{
+    DenyAction, DisconnectPersistResult, DspTarget, RouteAction, RuleEngine, endpoint_matcher,
+    has_other_matching_link, record_manual_connect, record_manual_disconnect,
+};
 use pipewire::core::Listener as CoreListener;
 use pipewire::link::Link;
 use pipewire::metadata::{Metadata, MetadataListener};
@@ -82,10 +85,12 @@ pub enum PwCommand {
         input_node_id: u32,
         input_port_id: u32,
         replace_input: bool,
+        persist: bool,
         reply: mpsc::SyncSender<Result<String, String>>,
     },
     DestroyManualLink {
         link_id: u32,
+        persist: bool,
         reply: mpsc::SyncSender<Result<String, String>>,
     },
     Shutdown,
@@ -210,6 +215,7 @@ impl PwHandle {
         input_node_id: u32,
         input_port_id: u32,
         replace_input: bool,
+        persist: bool,
     ) -> Result<String, String> {
         let (tx, rx) = mpsc::sync_channel(1);
         self.send_command(PwCommand::CreateManualLink {
@@ -218,15 +224,20 @@ impl PwHandle {
             input_node_id,
             input_port_id,
             replace_input,
+            persist,
             reply: tx,
         })?;
         rx.recv_timeout(Duration::from_secs(3))
             .map_err(|e| format!("Vypršel timeout při vytváření linku: {e}"))?
     }
 
-    pub fn destroy_manual_link(&self, link_id: u32) -> Result<String, String> {
+    pub fn destroy_manual_link(&self, link_id: u32, persist: bool) -> Result<String, String> {
         let (tx, rx) = mpsc::sync_channel(1);
-        self.send_command(PwCommand::DestroyManualLink { link_id, reply: tx })?;
+        self.send_command(PwCommand::DestroyManualLink {
+            link_id,
+            persist,
+            reply: tx,
+        })?;
         rx.recv_timeout(Duration::from_secs(3))
             .map_err(|e| format!("Vypršel timeout při rozpojování linku: {e}"))?
     }
@@ -743,25 +754,40 @@ impl DaemonState {
         input_node_id: u32,
         input_port_id: u32,
         replace_input: bool,
+        persist: bool,
     ) -> Result<String, String> {
-        let out_node = self.graph.node(output_node_id);
-        let out_port = self.graph.port(output_port_id);
-        let in_node = self.graph.node(input_node_id);
-        let in_port = self.graph.port(input_port_id);
+        let Some(out_node) = self.graph.node(output_node_id).cloned() else {
+            return Err("Zdrojový uzel v PipeWire grafu neexistuje".to_string());
+        };
+        let Some(out_port) = self.graph.port(output_port_id).cloned() else {
+            return Err("Zdrojový port v PipeWire grafu neexistuje".to_string());
+        };
+        let Some(in_node) = self.graph.node(input_node_id).cloned() else {
+            return Err("Cílový uzel v PipeWire grafu neexistuje".to_string());
+        };
+        let Some(in_port) = self.graph.port(input_port_id).cloned() else {
+            return Err("Cílový port v PipeWire grafu neexistuje".to_string());
+        };
 
-        if out_node.is_none() || out_port.is_none() || in_node.is_none() || in_port.is_none() {
-            return Err("Zadaný uzel nebo port v PipeWire grafu neexistuje".to_string());
-        }
-
-        if let Some(rule) = self
-            .engine
-            .find_deny_for_endpoints(out_node, out_port, in_node, in_port)
+        if !persist
+            && let Some(rule) = self.engine.find_deny_for_endpoints(
+                Some(&out_node),
+                Some(&out_port),
+                Some(&in_node),
+                Some(&in_port),
+            )
         {
             return Err(format!(
                 "Link je zablokován pravidlem [[deny]] '{}'",
                 rule.name
             ));
         }
+
+        let mut next_cfg = if persist {
+            Some(self.engine.config().clone())
+        } else {
+            None
+        };
 
         let mut replaced_count = 0usize;
         if replace_input {
@@ -772,6 +798,17 @@ impl DaemonState {
             );
 
             for old_id in conflicting_links {
+                if let Some(cfg) = next_cfg.as_mut()
+                    && let Some(resolved) = self.graph.resolve_link(old_id)
+                    && let (Some(on), Some(op), Some(inn), Some(inp)) = (
+                        resolved.output_node,
+                        resolved.output_port,
+                        resolved.input_node,
+                        resolved.input_port,
+                    )
+                {
+                    record_manual_disconnect(cfg, on, op, inn, inp, false);
+                }
                 if let Err(err) = self.registry.destroy_global(old_id).into_result() {
                     warn!(old_id, error = ?err, "Nepodařilo se odpojit předchozí link ze stejného zdrojového uzlu");
                 } else {
@@ -781,12 +818,21 @@ impl DaemonState {
             }
         }
 
+        if let Some(mut cfg) = next_cfg {
+            let changed = record_manual_connect(&mut cfg, &out_node, &out_port, &in_node, &in_port);
+            if changed || replaced_count > 0 {
+                self.save_and_apply_config(cfg)?;
+            }
+        }
+
         if self
             .graph
             .find_link_between_ports(output_port_id, input_port_id)
             .is_some()
         {
-            return Ok(if replaced_count > 0 {
+            return Ok(if persist {
+                "Spojení zachováno a uloženo do rules.toml".to_string()
+            } else if replaced_count > 0 {
                 format!("Předchozí linky ({replaced_count}) odpojeny, spojení zachováno")
             } else {
                 "Link již existuje".to_string()
@@ -818,9 +864,12 @@ impl DaemonState {
             input_node_id,
             input_port_id,
             replaced_count,
+            persist,
             "Vytvořen ruční PipeWire link"
         );
-        if replaced_count > 0 {
+        if persist {
+            Ok("Propojeno a trvale uloženo do rules.toml".to_string())
+        } else if replaced_count > 0 {
             Ok(format!(
                 "Přepojeno na {output_node_id}:{output_port_id} -> {input_node_id}:{input_port_id} (předchozí kabel ze stejného zdroje odpojen)"
             ))
@@ -831,16 +880,59 @@ impl DaemonState {
         }
     }
 
-    fn destroy_manual_link(&mut self, link_id: u32) -> Result<String, String> {
+    fn destroy_manual_link(&mut self, link_id: u32, persist: bool) -> Result<String, String> {
+        let resolved_info = self.graph.resolve_link(link_id).and_then(|res| {
+            Some((
+                res.output_node?.clone(),
+                res.output_port?.clone(),
+                res.input_node?.clone(),
+                res.input_port?.clone(),
+            ))
+        });
+
         if self.graph.link(link_id).is_none() {
             return Err(format!("Link #{link_id} v grafu neexistuje"));
         }
+
+        let sibling_exists = if persist
+            && let Some((on, op, inn, inp)) = &resolved_info
+            && let (Some(sm), Some(dm)) = (endpoint_matcher(on, op), endpoint_matcher(inn, inp))
+        {
+            has_other_matching_link(&self.graph, link_id, &sm, &dm)
+        } else {
+            false
+        };
+
         self.registry
             .destroy_global(link_id)
             .into_result()
             .map_err(|e| format!("Selhalo rozpojení linku #{link_id}: {e:?}"))?;
         self.graph.remove_global(link_id);
-        info!(link_id, "Link ručně rozpojen");
+        info!(link_id, persist, "Link ručně rozpojen");
+
+        if persist && let Some((on, op, inn, inp)) = resolved_info {
+            let mut next_cfg = self.engine.config().clone();
+            let res =
+                record_manual_disconnect(&mut next_cfg, &on, &op, &inn, &inp, !sibling_exists);
+            if res != DisconnectPersistResult::NoChange {
+                self.save_and_apply_config(next_cfg)?;
+            }
+            return Ok(match res {
+                DisconnectPersistResult::SavedDenyRule => {
+                    "Odpojeno a trvale uloženo do rules.toml (po restartu se znovu nepřipojí)"
+                        .to_string()
+                }
+                _ if sibling_exists => {
+                    "Link odpojen (jiný identický proud zůstává aktivní; trvalé pravidlo se uloží po odpojení posledního)"
+                        .to_string()
+                }
+                DisconnectPersistResult::RemovedRouteOnly => {
+                    "Odpojeno a předchozí route odstraněna z rules.toml".to_string()
+                }
+                DisconnectPersistResult::NoChange => format!("Link #{link_id} odpojen"),
+            });
+        }
+
         Ok(format!("Link #{link_id} rozpojen"))
     }
 
@@ -1491,25 +1583,44 @@ fn run_single_pipewire_session(
             reply,
         } => {
             let mut st = state_cmd.borrow_mut();
+            let mut next_cfg = st.engine.config().clone();
+            let profile_active = st
+                .engine
+                .evaluate_dsp(&st.graph, None, None)
+                .active_profile
+                .is_some();
+
             match quantum {
                 DspOverrideChange::Keep => {}
-                DspOverrideChange::Clear => st.manual_quantum_override = None,
-                DspOverrideChange::Set(0) => {
-                    let _ = reply.send(Err("Quantum nesmí být 0".to_string()));
-                    return;
+                DspOverrideChange::Clear => {
+                    st.manual_quantum_override = None;
+                    next_cfg.dsp.default_quantum = None;
                 }
-                DspOverrideChange::Set(q) => st.manual_quantum_override = Some(q),
+                DspOverrideChange::Set(q) => {
+                    next_cfg.dsp.default_quantum = Some(q);
+                    st.manual_quantum_override = if profile_active { Some(q) } else { None };
+                }
             }
             match rate {
                 DspOverrideChange::Keep => {}
-                DspOverrideChange::Clear => st.manual_rate_override = None,
-                DspOverrideChange::Set(r) if r < 8_000 => {
-                    let _ = reply.send(Err("Sample rate musí být alespoň 8000 Hz".to_string()));
-                    return;
+                DspOverrideChange::Clear => {
+                    st.manual_rate_override = None;
+                    next_cfg.dsp.default_rate = None;
                 }
-                DspOverrideChange::Set(r) => st.manual_rate_override = Some(r),
+                DspOverrideChange::Set(r) => {
+                    next_cfg.dsp.default_rate = Some(r);
+                    st.manual_rate_override = if profile_active { Some(r) } else { None };
+                }
             }
-            st.reconcile_dsp();
+
+            if let Err(err) = next_cfg.validate() {
+                let _ = reply.send(Err(err.to_string()));
+                return;
+            }
+            if let Err(err) = st.save_and_apply_config(next_cfg) {
+                let _ = reply.send(Err(err));
+                return;
+            }
             let target = st.engine.evaluate_dsp(
                 &st.graph,
                 st.manual_quantum_override,
@@ -1523,9 +1634,21 @@ fn run_single_pipewire_session(
             value,
             reply,
         } => {
-            let res = state_cmd
-                .borrow()
-                .set_pw_setting_live(target, &key, value.as_deref());
+            let mut st = state_cmd.borrow_mut();
+            let res = match st.set_pw_setting_live(target, &key, value.as_deref()) {
+                Ok(live_msg) => {
+                    let mut next_cfg = st.engine.config().clone();
+                    match next_cfg.apply_metadata_override(&key, value.as_deref()) {
+                        Ok(true) => match st.save_and_apply_config(next_cfg) {
+                            Ok(_) => Ok(format!("{live_msg} (uloženo do rules.toml)")),
+                            Err(err) => Err(err),
+                        },
+                        Ok(false) => Ok(live_msg),
+                        Err(err) => Err(err),
+                    }
+                }
+                Err(err) => Err(err),
+            };
             let _ = reply.send(res);
         }
         PwCommand::SetDefaultDevice {
@@ -1533,7 +1656,28 @@ fn run_single_pipewire_session(
             node_name,
             reply,
         } => {
-            let res = state_cmd.borrow().set_default_device(kind, node_name);
+            let mut st = state_cmd.borrow_mut();
+            let res = match st.set_default_device(kind, node_name.clone()) {
+                Ok(live_msg) => {
+                    let mut next_cfg = st.engine.config().clone();
+                    let cleaned = node_name
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty());
+                    match kind {
+                        DefaultDeviceKind::Sink => {
+                            next_cfg.pw_settings.default_audio_sink = cleaned
+                        }
+                        DefaultDeviceKind::Source => {
+                            next_cfg.pw_settings.default_audio_source = cleaned;
+                        }
+                    }
+                    match st.save_and_apply_config(next_cfg) {
+                        Ok(_) => Ok(format!("{live_msg} (uloženo do rules.toml)")),
+                        Err(err) => Err(err),
+                    }
+                }
+                Err(err) => Err(err),
+            };
             let _ = reply.send(res);
         }
         PwCommand::CreateManualLink {
@@ -1542,6 +1686,7 @@ fn run_single_pipewire_session(
             input_node_id,
             input_port_id,
             replace_input,
+            persist,
             reply,
         } => {
             let res = state_cmd.borrow_mut().create_manual_link(
@@ -1550,11 +1695,16 @@ fn run_single_pipewire_session(
                 input_node_id,
                 input_port_id,
                 replace_input,
+                persist,
             );
             let _ = reply.send(res);
         }
-        PwCommand::DestroyManualLink { link_id, reply } => {
-            let res = state_cmd.borrow_mut().destroy_manual_link(link_id);
+        PwCommand::DestroyManualLink {
+            link_id,
+            persist,
+            reply,
+        } => {
+            let res = state_cmd.borrow_mut().destroy_manual_link(link_id, persist);
             let _ = reply.send(res);
         }
         PwCommand::Shutdown => {

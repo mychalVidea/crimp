@@ -275,6 +275,205 @@ impl RuleEngine {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DisconnectPersistResult {
+    SavedDenyRule,
+    RemovedRouteOnly,
+    NoChange,
+}
+
+/// Vytvoří přesný matcher koncového portu (`node_name` + `application_name` + `media_class` + `port_name`),
+/// který přežije restart aplikací i změnu číselných PipeWire ID.
+#[must_use]
+pub fn endpoint_matcher(node: &NodeInfo, port: &PortInfo) -> Option<NodeMatcher> {
+    let matcher = NodeMatcher {
+        node_name: node.node_name.clone().filter(|s| !s.trim().is_empty()),
+        application_name: node
+            .application_name
+            .clone()
+            .filter(|s| !s.trim().is_empty()),
+        media_class: node.media_class.clone().filter(|s| !s.trim().is_empty()),
+        port_name: port.port_name.clone().filter(|s| !s.trim().is_empty()),
+    };
+    (!matcher.is_empty()).then_some(matcher)
+}
+
+/// Ověří, zda v grafu existuje jiný živý link se stejnými matchery koncových portů
+/// (např. při více identických streamech OBS). Zabraňuje předčasnému zablokování sourozence.
+#[must_use]
+pub fn has_other_matching_link(
+    graph: &AudioGraph,
+    excluded_link_id: u32,
+    src_matcher: &NodeMatcher,
+    dst_matcher: &NodeMatcher,
+) -> bool {
+    graph.links().any(|l| {
+        if l.id == excluded_link_id {
+            return false;
+        }
+        let Some(res) = graph.resolve_link(l.id) else {
+            return false;
+        };
+        matcher_matches_endpoint(src_matcher, res.output_node, res.output_port)
+            && matcher_matches_endpoint(dst_matcher, res.input_node, res.input_port)
+    })
+}
+
+/// Promítne ruční rozpojení drátu v Patchbayi do konfigurace (`rules.toml`):
+/// 1) vypne/odstraní případnou kolidující `[[route]]`,
+/// 2) volitelně zapíše/zapne trvalé `[[deny]]` pravidlo, aby WirePlumber drát po restartu znovu nespojil.
+pub fn record_manual_disconnect(
+    cfg: &mut Config,
+    out_node: &NodeInfo,
+    out_port: &PortInfo,
+    in_node: &NodeInfo,
+    in_port: &PortInfo,
+    add_deny_rule: bool,
+) -> DisconnectPersistResult {
+    let (Some(src_matcher), Some(dst_matcher)) = (
+        endpoint_matcher(out_node, out_port),
+        endpoint_matcher(in_node, in_port),
+    ) else {
+        return DisconnectPersistResult::NoChange;
+    };
+
+    let mut changed = false;
+    let mut i = 0;
+    while i < cfg.route.len() {
+        let r = &mut cfg.route[i];
+        let matches = r.enabled
+            && matcher_matches_endpoint(&r.source, Some(out_node), Some(out_port))
+            && matcher_matches_endpoint(&r.target, Some(in_node), Some(in_port));
+        if matches {
+            changed = true;
+            if r.name.starts_with("Spojeno:")
+                || (r.source.port_name.is_some() && r.target.port_name.is_some())
+            {
+                cfg.route.remove(i);
+                continue;
+            }
+            r.enabled = false;
+        }
+        i += 1;
+    }
+
+    if !add_deny_rule {
+        return if changed {
+            DisconnectPersistResult::RemovedRouteOnly
+        } else {
+            DisconnectPersistResult::NoChange
+        };
+    }
+
+    let already_denied = cfg.deny.iter().any(|rule| {
+        rule.enabled
+            && matcher_matches_endpoint(&rule.source, Some(out_node), Some(out_port))
+            && matcher_matches_endpoint(&rule.target, Some(in_node), Some(in_port))
+    });
+    if already_denied {
+        return if changed {
+            DisconnectPersistResult::SavedDenyRule
+        } else {
+            DisconnectPersistResult::NoChange
+        };
+    }
+
+    if let Some(disabled_exact) = cfg
+        .deny
+        .iter_mut()
+        .find(|rule| !rule.enabled && rule.source == src_matcher && rule.target == dst_matcher)
+    {
+        disabled_exact.enabled = true;
+        return DisconnectPersistResult::SavedDenyRule;
+    }
+
+    let src_port_lbl = out_port.port_name.as_deref().unwrap_or("out");
+    let dst_port_lbl = in_port.port_name.as_deref().unwrap_or("in");
+    cfg.deny.push(DenyRule {
+        name: format!(
+            "Odpojeno: {} ({src_port_lbl}) -> {} ({dst_port_lbl})",
+            out_node.display_label(),
+            in_node.display_label()
+        ),
+        enabled: true,
+        source: src_matcher,
+        target: dst_matcher,
+    });
+    DisconnectPersistResult::SavedDenyRule
+}
+
+/// Promítne ruční spojení drátu v Patchbayi do konfigurace (`rules.toml`):
+/// 1) odblokuje kolidující `[[deny]]` pravidlo,
+/// 2) uloží neexkluzivní `[[route]]` (`exclusive = false`), aby se spojení obnovilo i po restartu.
+pub fn record_manual_connect(
+    cfg: &mut Config,
+    out_node: &NodeInfo,
+    out_port: &PortInfo,
+    in_node: &NodeInfo,
+    in_port: &PortInfo,
+) -> bool {
+    let (Some(src_matcher), Some(dst_matcher)) = (
+        endpoint_matcher(out_node, out_port),
+        endpoint_matcher(in_node, in_port),
+    ) else {
+        return false;
+    };
+
+    let mut changed = false;
+    let mut i = 0;
+    while i < cfg.deny.len() {
+        let rule = &mut cfg.deny[i];
+        let matches = rule.enabled
+            && matcher_matches_endpoint(&rule.source, Some(out_node), Some(out_port))
+            && matcher_matches_endpoint(&rule.target, Some(in_node), Some(in_port));
+        if matches {
+            changed = true;
+            if rule.name.starts_with("Odpojeno:")
+                || (rule.source.port_name.is_some() && rule.target.port_name.is_some())
+            {
+                cfg.deny.remove(i);
+                continue;
+            }
+            rule.enabled = false;
+        }
+        i += 1;
+    }
+
+    let already_routed = cfg.route.iter().any(|rule| {
+        rule.enabled
+            && matcher_matches_endpoint(&rule.source, Some(out_node), Some(out_port))
+            && matcher_matches_endpoint(&rule.target, Some(in_node), Some(in_port))
+    });
+    if already_routed {
+        return changed;
+    }
+
+    if let Some(disabled_exact) = cfg
+        .route
+        .iter_mut()
+        .find(|rule| !rule.enabled && rule.source == src_matcher && rule.target == dst_matcher)
+    {
+        disabled_exact.enabled = true;
+        disabled_exact.exclusive = false;
+        return true;
+    }
+
+    let src_port_lbl = out_port.port_name.as_deref().unwrap_or("out");
+    let dst_port_lbl = in_port.port_name.as_deref().unwrap_or("in");
+    cfg.route.push(RouteRule {
+        name: format!(
+            "Spojeno: {} ({src_port_lbl}) -> {} ({dst_port_lbl})",
+            out_node.display_label(),
+            in_node.display_label()
+        ),
+        enabled: true,
+        exclusive: false,
+        source: src_matcher,
+        target: dst_matcher,
+    });
+    true
+}
+
 fn filtered_ports<'a>(
     graph: &'a AudioGraph,
     node_id: u32,
@@ -711,5 +910,83 @@ mod tests {
             engine.resolve_alias(&mc_in).as_deref(),
             Some("Minecraft (Mic)")
         );
+    }
+
+    #[test]
+    fn manual_disconnect_and_reconnect_persist_cleanly() {
+        let mut graph = AudioGraph::new();
+        let out_node = NodeInfo {
+            id: 1,
+            node_name: Some("OBS-Monitor".into()),
+            node_description: None,
+            application_name: Some("OBS".into()),
+            media_class: Some("Stream/Output/Audio".into()),
+            node_latency: None,
+            node_rate: None,
+        };
+        let out_port = PortInfo {
+            id: 11,
+            node_id: 1,
+            port_name: Some("output_FL".into()),
+            direction: PortDirection::Output,
+            channel: Some("FL".into()),
+        };
+        let in_node = NodeInfo {
+            id: 2,
+            node_name: Some("alsa_output.test".into()),
+            node_description: None,
+            application_name: None,
+            media_class: Some("Audio/Sink".into()),
+            node_latency: None,
+            node_rate: None,
+        };
+        let in_port = PortInfo {
+            id: 21,
+            node_id: 2,
+            port_name: Some("playback_FL".into()),
+            direction: PortDirection::Input,
+            channel: Some("FL".into()),
+        };
+        graph.upsert_node(out_node.clone());
+        graph.upsert_port(out_port.clone());
+        graph.upsert_node(in_node.clone());
+        graph.upsert_port(in_port.clone());
+        graph.upsert_link(LinkInfo {
+            id: 50,
+            output_node_id: 1,
+            output_port_id: 11,
+            input_node_id: 2,
+            input_port_id: 21,
+        });
+
+        let src_m = endpoint_matcher(&out_node, &out_port).expect("src matcher");
+        let dst_m = endpoint_matcher(&in_node, &in_port).expect("dst matcher");
+        assert!(!has_other_matching_link(&graph, 50, &src_m, &dst_m));
+
+        let mut cfg = Config::default();
+        assert_eq!(
+            record_manual_disconnect(&mut cfg, &out_node, &out_port, &in_node, &in_port, true),
+            DisconnectPersistResult::SavedDenyRule
+        );
+        assert_eq!(cfg.deny.len(), 1);
+
+        let engine = RuleEngine::new(cfg.clone());
+        assert!(
+            engine
+                .find_deny_for_endpoints(
+                    Some(&out_node),
+                    Some(&out_port),
+                    Some(&in_node),
+                    Some(&in_port)
+                )
+                .is_some()
+        );
+
+        assert!(record_manual_connect(
+            &mut cfg, &out_node, &out_port, &in_node, &in_port
+        ));
+        assert!(cfg.deny.is_empty());
+        assert_eq!(cfg.route.len(), 1);
+        assert!(!cfg.route[0].exclusive);
     }
 }

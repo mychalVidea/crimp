@@ -47,6 +47,12 @@ pub struct SavedLayout {
     pub hide_internal_and_midi: bool,
     #[serde(default)]
     pub scroll_mode: ScrollMode,
+    #[serde(default = "default_true")]
+    pub persist_topology: bool,
+}
+
+const fn default_true() -> bool {
+    true
 }
 
 impl Default for SavedLayout {
@@ -57,6 +63,7 @@ impl Default for SavedLayout {
             zoom: 1.0,
             hide_internal_and_midi: true,
             scroll_mode: ScrollMode::Auto,
+            persist_topology: true,
         }
     }
 }
