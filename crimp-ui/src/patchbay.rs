@@ -15,11 +15,14 @@ use std::time::{Duration, Instant};
 const HEADER_HEIGHT: f32 = 44.0;
 const PORT_ROW_HEIGHT: f32 = 24.0;
 const PORT_PIN_RADIUS: f32 = 5.4;
+const ZOOM_MIN: f32 = 0.35;
+const ZOOM_MAX: f32 = 2.0;
 
 #[derive(Debug, Clone, Copy)]
 struct PendingDragLink {
     output_node_id: u32,
     output_port_id: u32,
+    is_click_mode: bool,
 }
 
 /// Stav interaktivního audio Patchbay plátna s trvalým ukládáním layoutu a aliasů.
@@ -30,6 +33,8 @@ pub struct PatchbayState {
     zoom: f32,
     needs_fit: bool,
     hide_internal_and_midi: bool,
+    touchpad_pan: bool,
+    pending_zoom_step: Option<f32>,
     layout_dirty_since: Option<Instant>,
     dragging_link: Option<PendingDragLink>,
     selected_node_id: Option<u32>,
@@ -44,8 +49,9 @@ impl Default for PatchbayState {
         let saved = load_saved_layout();
         let has_saved_positions = !saved.node_positions.is_empty();
         let pan = arr_to_vec(saved.pan);
-        let zoom = saved.zoom.clamp(0.45, 1.75);
+        let zoom = saved.zoom.clamp(ZOOM_MIN, ZOOM_MAX);
         let hide_internal_and_midi = saved.hide_internal_and_midi;
+        let touchpad_pan = saved.touchpad_pan;
         Self {
             positions: HashMap::new(),
             saved,
@@ -53,6 +59,8 @@ impl Default for PatchbayState {
             zoom,
             needs_fit: !has_saved_positions,
             hide_internal_and_midi,
+            touchpad_pan,
+            pending_zoom_step: None,
             layout_dirty_since: None,
             dragging_link: None,
             selected_node_id: None,
@@ -81,6 +89,7 @@ impl PatchbayState {
         self.saved.pan = vec_to_arr(self.pan);
         self.saved.zoom = self.zoom;
         self.saved.hide_internal_and_midi = self.hide_internal_and_midi;
+        self.saved.touchpad_pan = self.touchpad_pan;
         save_layout(&self.saved);
         self.layout_dirty_since = None;
     }
@@ -90,10 +99,26 @@ impl PatchbayState {
         self.saved = load_saved_layout();
         self.positions.clear();
         self.pan = arr_to_vec(self.saved.pan);
-        self.zoom = self.saved.zoom.clamp(0.45, 1.75);
+        self.zoom = self.saved.zoom.clamp(ZOOM_MIN, ZOOM_MAX);
         self.hide_internal_and_midi = self.saved.hide_internal_and_midi;
+        self.touchpad_pan = self.saved.touchpad_pan;
         self.needs_fit = self.saved.node_positions.is_empty();
         self.layout_dirty_since = None;
+    }
+
+    fn apply_zoom_at(&mut self, canvas_rect: Rect, target_zoom: f32, anchor: Option<Pos2>) {
+        let new_zoom = target_zoom.clamp(ZOOM_MIN, ZOOM_MAX);
+        if (new_zoom - self.zoom).abs() < 0.0001 {
+            return;
+        }
+        let anchor_screen = anchor
+            .filter(|p| canvas_rect.contains(*p))
+            .unwrap_or_else(|| canvas_rect.center());
+        let local_ptr = anchor_screen - canvas_rect.min;
+        let world_before = (local_ptr - self.pan) / self.zoom;
+        self.zoom = new_zoom;
+        self.pan = local_ptr - world_before * self.zoom;
+        self.mark_dirty();
     }
 
     pub fn show(
@@ -121,13 +146,51 @@ impl PatchbayState {
             self.flush_saved_layout(Some(graph));
         }
 
+        // Klávesové zkratky Patchbaye (Delete odpojí vybraný kabel, Esc zruší tahání/výběr, +/- zoom, F/0 fit)
+        if !ui.ctx().text_edit_focused() {
+            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                if self.dragging_link.is_some() {
+                    self.dragging_link = None;
+                } else {
+                    self.selected_link_id = None;
+                    self.selected_node_id = None;
+                }
+            }
+            if let Some(link_id) = self.selected_link_id
+                && ui.input(|i| {
+                    i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace)
+                })
+            {
+                client.send_command(IpcRequest::DestroyLink { link_id });
+                self.selected_link_id = None;
+            }
+            if ui.input(|i| i.key_pressed(egui::Key::F) || i.key_pressed(egui::Key::Num0)) {
+                self.needs_fit = true;
+                self.mark_dirty();
+            }
+            if ui.input(|i| i.key_pressed(egui::Key::Plus) || i.key_pressed(egui::Key::Equals)) {
+                self.pending_zoom_step = Some(1.16);
+            }
+            if ui.input(|i| i.key_pressed(egui::Key::Minus)) {
+                self.pending_zoom_step = Some(1.0 / 1.16);
+            }
+        }
+
         // Horní ovládací pruh patchbaye
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.add(
                 egui::TextEdit::singleline(&mut self.filter_query)
-                    .desired_width(200.0)
-                    .hint_text("Hledat aplikaci, alias nebo zařízení..."),
+                    .desired_width(185.0)
+                    .hint_text("Hledat uzel / aplikaci..."),
             );
+            if !self.filter_query.is_empty()
+                && ui
+                    .small_button("×")
+                    .on_hover_text("Vyčistit vyhledávání")
+                    .clicked()
+            {
+                self.filter_query.clear();
+            }
             if ui
                 .button("Auto-layout")
                 .on_hover_text("Vyresetuje uložené pozice a znovu srovná uzly do sloupců")
@@ -140,7 +203,7 @@ impl PatchbayState {
             }
             if ui
                 .button("Vycentrovat")
-                .on_hover_text("Přizpůsobí pohled tak, aby byly vidět všechny uzly")
+                .on_hover_text("Přizpůsobí pohled tak, aby byly vidět všechny uzly (zkratka: F nebo dvojklik na plátno)")
                 .clicked()
             {
                 self.needs_fit = true;
@@ -149,7 +212,7 @@ impl PatchbayState {
             if ui
                 .checkbox(
                     &mut self.hide_internal_and_midi,
-                    "Jen Audio (skrýt Dummy/MIDI)",
+                    "Jen Audio",
                 )
                 .on_hover_text(
                     "Skryje interní PipeWire drivery a prázdné MIDI mosty pro přehlednější graf",
@@ -158,14 +221,45 @@ impl PatchbayState {
             {
                 self.mark_dirty();
             }
+            if ui
+                .checkbox(&mut self.touchpad_pan, "2 prsty: Posun")
+                .on_hover_text(
+                    "Režim pro touchpad: 2 prsty na touchpadu plynule posouvají plátno, Pinch gesto (nebo Ctrl+Scroll) zoomuje.\nKdyž je vypnuto, kolečko myši i vertikální scroll rovnou zoomují (horizontální scroll i Shift+Scroll posouvají).",
+                )
+                .changed()
+            {
+                self.mark_dirty();
+            }
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .small_button("+")
+                    .on_hover_text("Přiblížit (+)")
+                    .clicked()
+                {
+                    self.pending_zoom_step = Some(1.16);
+                }
+                if ui
+                    .small_button(format!("{:.0}%", self.zoom * 100.0))
+                    .on_hover_text("Kliknutím vycentruješ a přizpůsobíš graf na okno (F / 0)")
+                    .clicked()
+                {
+                    self.needs_fit = true;
+                    self.mark_dirty();
+                }
+                if ui
+                    .small_button("−")
+                    .on_hover_text("Oddálit (-)")
+                    .clicked()
+                {
+                    self.pending_zoom_step = Some(1.0 / 1.16);
+                }
+                theme::spec_divider(ui);
                 ui.label(
                     egui::RichText::new(format!(
-                        "{} uzlů  ·  {} linků  ·  {:.0}%",
+                        "{} uzlů  ·  {} linků",
                         graph.nodes.len(),
                         graph.links.len(),
-                        self.zoom * 100.0
                     ))
                     .color(theme::TEXT_MUTED)
                     .size(12.0),
@@ -315,7 +409,7 @@ impl PatchbayState {
 
         self.zoom = (avail_w / content_w)
             .min(avail_h / content_h)
-            .clamp(0.65, 1.05);
+            .clamp(ZOOM_MIN.max(0.40), 1.05);
         let scaled_w = content_w * self.zoom;
         let scaled_h = content_h * self.zoom;
         self.pan = Vec2::new(
@@ -339,20 +433,38 @@ impl PatchbayState {
 
         let canvas_resp = ui.allocate_rect(canvas_rect, Sense::click_and_drag());
 
-        if canvas_resp.hovered() {
-            let scroll = ui.input(|i| i.smooth_scroll_delta.y);
-            if scroll.abs() > 0.1 {
-                let factor = (1.0 + scroll * 0.0018).clamp(0.85, 1.2);
-                let new_zoom = (self.zoom * factor).clamp(0.45, 1.75);
-                if let Some(pointer) = ui.input(|i| i.pointer.hover_pos()) {
-                    let local_ptr = pointer - canvas_rect.min;
-                    let world_before = (local_ptr - self.pan) / self.zoom;
-                    self.zoom = new_zoom;
-                    self.pan = local_ptr - world_before * self.zoom;
+        if let Some(step) = self.pending_zoom_step.take() {
+            self.apply_zoom_at(canvas_rect, self.zoom * step, None);
+        }
+
+        let latest_pos = ui.input(|i| i.pointer.latest_pos());
+        let pointer_in_canvas =
+            latest_pos.is_some_and(|p| canvas_rect.contains(p)) || canvas_resp.hovered();
+
+        if pointer_in_canvas {
+            // Touchpad Pinch-to-Zoom (`PinchGesture`), dotykový pinch i `Ctrl + Scroll`
+            let pinch_zoom = ui.input(|i| i.zoom_delta());
+            if (pinch_zoom - 1.0).abs() > 0.0005 {
+                self.apply_zoom_at(canvas_rect, self.zoom * pinch_zoom, latest_pos);
+            }
+
+            // Kolečko myši / 2-prstý scroll na touchpadu / Shift+Scroll posun
+            let scroll = ui.input(|i| i.smooth_scroll_delta);
+            if scroll != Vec2::ZERO {
+                let shift = ui.input(|i| i.modifiers.shift);
+                if self.touchpad_pan || shift {
+                    self.pan += scroll;
+                    self.mark_dirty();
                 } else {
-                    self.zoom = new_zoom;
+                    if scroll.y.abs() > 0.1 {
+                        let factor = (scroll.y * 0.0022).exp().clamp(0.75, 1.35);
+                        self.apply_zoom_at(canvas_rect, self.zoom * factor, latest_pos);
+                    }
+                    if scroll.x.abs() > 0.1 {
+                        self.pan.x += scroll.x;
+                        self.mark_dirty();
+                    }
                 }
-                self.mark_dirty();
             }
         }
 
@@ -364,7 +476,10 @@ impl PatchbayState {
             self.mark_dirty();
         }
 
-        if canvas_resp.clicked() {
+        if canvas_resp.double_clicked() {
+            self.needs_fit = true;
+            self.mark_dirty();
+        } else if canvas_resp.clicked() && self.dragging_link.is_none() {
             self.selected_link_id = None;
         }
 
@@ -444,18 +559,20 @@ impl PatchbayState {
             // Celá karta uzlu je uchopitelná pro rychlé přesouvání (výstupní piny registrované níže mají přednost).
             let card_id = ui.scope_id().with(("node_drag", node.id));
             let card_resp = ui.interact(rect, card_id, Sense::click_and_drag());
-            if card_resp.drag_started() || card_resp.clicked() {
-                self.selected_node_id = Some(node.id);
-                self.selected_link_id = None;
-            }
-            if card_resp.dragged() {
-                dragging_any_node = true;
-                if let Some(pos) = self.positions.get_mut(&node.id) {
-                    *pos += card_resp.drag_delta() / self.zoom;
-                    self.mark_dirty();
+            if self.dragging_link.is_none() {
+                if card_resp.drag_started() || card_resp.clicked() {
+                    self.selected_node_id = Some(node.id);
+                    self.selected_link_id = None;
                 }
-            } else if card_resp.hovered() {
-                hovering_any_node = true;
+                if card_resp.dragged() {
+                    dragging_any_node = true;
+                    if let Some(pos) = self.positions.get_mut(&node.id) {
+                        *pos += card_resp.drag_delta() / self.zoom;
+                        self.mark_dirty();
+                    }
+                } else if card_resp.hovered() {
+                    hovering_any_node = true;
+                }
             }
 
             let title_x = header_rect.left() + 20.0 * self.zoom;
@@ -588,8 +705,10 @@ impl PatchbayState {
             }
         }
 
-        // Tahání nového kabelu z Output pinu (rozšířený hitbox pokrývá i popisek portu)
+        // Tahání nebo kliknutí na Output pin (rozšířený hitbox pokrývá i popisek portu;
+        // na touchpadu stačí 1× kliknout na výstup a pak kliknout na cílový vstup bez držení prstu!)
         let mut hovering_pin = false;
+        let mut started_click_mode_this_frame = false;
         for &(out_node_id, out_port_id, hit_rect) in &out_pin_rects {
             let resp = ui.interact(
                 hit_rect,
@@ -603,8 +722,33 @@ impl PatchbayState {
                 self.dragging_link = Some(PendingDragLink {
                     output_node_id: out_node_id,
                     output_port_id: out_port_id,
+                    is_click_mode: false,
                 });
+            } else if resp.clicked() {
+                let already_selected = self
+                    .dragging_link
+                    .is_some_and(|d| d.is_click_mode && d.output_port_id == out_port_id);
+                if already_selected {
+                    self.dragging_link = None;
+                } else {
+                    self.dragging_link = Some(PendingDragLink {
+                        output_node_id: out_node_id,
+                        output_port_id: out_port_id,
+                        is_click_mode: true,
+                    });
+                    started_click_mode_this_frame = true;
+                }
             }
+        }
+
+        if let Some(drag) = self.dragging_link
+            && let Some(&out_pos) = port_screen_pos.get(&drag.output_port_id)
+        {
+            painter.circle_stroke(
+                out_pos,
+                (PORT_PIN_RADIUS + 4.0) * self.zoom,
+                Stroke::new(2.0, theme::ECONOMY_GREEN),
+            );
         }
 
         if self.dragging_link.is_some() || hovering_pin {
@@ -616,21 +760,25 @@ impl PatchbayState {
         }
 
         // Vyhledání přesně jednoho nejbližšího kabelu pod kurzorem (i při více linkách do jednoho pinu)
-        let hovered_link_id = pointer_pos.and_then(|ptr| {
-            graph
-                .links
-                .iter()
-                .filter_map(|link| {
-                    let (p0, p3) = (
-                        *port_screen_pos.get(&link.output_port_id)?,
-                        *port_screen_pos.get(&link.input_port_id)?,
-                    );
-                    let dist = bezier_min_distance(p0, p3, ptr);
-                    (dist <= 12.0).then_some((link.id, dist))
-                })
-                .min_by(|a, b| a.1.total_cmp(&b.1))
-                .map(|(id, _)| id)
-        });
+        let hovered_link_id = if self.dragging_link.is_some() {
+            None
+        } else {
+            pointer_pos.and_then(|ptr| {
+                graph
+                    .links
+                    .iter()
+                    .filter_map(|link| {
+                        let (p0, p3) = (
+                            *port_screen_pos.get(&link.output_port_id)?,
+                            *port_screen_pos.get(&link.input_port_id)?,
+                        );
+                        let dist = bezier_min_distance(p0, p3, ptr);
+                        (dist <= 12.0).then_some((link.id, dist))
+                    })
+                    .min_by(|a, b| a.1.total_cmp(&b.1))
+                    .map(|(id, _)| id)
+            })
+        };
 
         let primary_clicked = ui.input(|i| i.pointer.primary_clicked());
         let secondary_clicked = ui.input(|i| i.pointer.secondary_clicked());
@@ -642,6 +790,42 @@ impl PatchbayState {
             }
             if secondary_clicked {
                 client.send_command(IpcRequest::DestroyLink { link_id });
+            } else if let Some(link) = graph.links.iter().find(|l| l.id == link_id)
+                && let (Some(&p0), Some(&p3)) = (
+                    port_screen_pos.get(&link.output_port_id),
+                    port_screen_pos.get(&link.input_port_id),
+                )
+            {
+                painter.circle_stroke(
+                    p0,
+                    (PORT_PIN_RADIUS + 3.0) * self.zoom,
+                    Stroke::new(2.0, theme::ECONOMY_GREEN),
+                );
+                painter.circle_stroke(
+                    p3,
+                    (PORT_PIN_RADIUS + 3.0) * self.zoom,
+                    Stroke::new(2.0, theme::ACCENT_BLUE),
+                );
+                egui::Tooltip::always_open(
+                    ui.ctx().clone(),
+                    ui.layer_id(),
+                    ui.scope_id().with("link_hover_tip"),
+                    egui::PopupAnchor::Pointer,
+                )
+                .show(|ui| {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{}  ->  {}",
+                            link.output_label, link.input_label
+                        ))
+                        .strong(),
+                    );
+                    ui.label(
+                        egui::RichText::new("Pravý klik nebo Delete: odpojit")
+                            .size(11.0)
+                            .color(theme::TEXT_MUTED),
+                    );
+                });
             }
         }
 
@@ -697,7 +881,24 @@ impl PatchbayState {
                 draw_cable(&painter, start, end, theme::ECONOMY_GREEN, 2.5);
             }
 
-            if ui.input(|i| i.pointer.any_released()) {
+            if drag.is_click_mode {
+                if !started_click_mode_this_frame {
+                    if primary_clicked {
+                        if let Some((in_node_id, in_port_id, _, _)) = snap_target {
+                            client.send_command(IpcRequest::CreateLink {
+                                output_node_id: drag.output_node_id,
+                                output_port_id: drag.output_port_id,
+                                input_node_id: in_node_id,
+                                input_port_id: in_port_id,
+                                replace_input: true,
+                            });
+                        }
+                        self.dragging_link = None;
+                    } else if secondary_clicked {
+                        self.dragging_link = None;
+                    }
+                }
+            } else if ui.input(|i| i.pointer.any_released()) {
                 if let Some((in_node_id, in_port_id, _, _)) = snap_target {
                     client.send_command(IpcRequest::CreateLink {
                         output_node_id: drag.output_node_id,
@@ -840,24 +1041,26 @@ impl PatchbayState {
                     .on_hover_text(
                         "Přejmenuje tento proces/zařízení jen pro přehlednost v Crimpu. Interně se stále použije pravý PipeWire název.",
                     );
-                    ui.add(
+                    let alias_resp = ui.add(
                         egui::TextEdit::singleline(&mut self.alias_input)
                             .desired_width(240.0)
                             .hint_text("Např. Minecraft nebo Sluchátka"),
                     );
+                    let enter_save = alias_resp.lost_focus()
+                        && ui.input(|i| i.key_pressed(egui::Key::Enter));
                     ui.horizontal(|ui| {
-                        if ui.button("Uložit název").clicked() {
+                        if (ui.button("Uložit název").clicked() || enter_save)
+                            && !self.alias_input.trim().is_empty()
+                        {
                             let new_name = self.alias_input.trim().to_string();
-                            if !new_name.is_empty() {
-                                let matcher = node_to_exact_alias_matcher(node);
-                                let mut next = cfg.clone();
-                                next.alias.retain(|a| a.matcher != matcher);
-                                next.alias.push(AliasRule {
-                                    matcher,
-                                    display_name: new_name,
-                                });
-                                client.send_command(IpcRequest::SaveConfig { config: next });
-                            }
+                            let matcher = node_to_exact_alias_matcher(node);
+                            let mut next = cfg.clone();
+                            next.alias.retain(|a| a.matcher != matcher);
+                            next.alias.push(AliasRule {
+                                matcher,
+                                display_name: new_name,
+                            });
+                            client.send_command(IpcRequest::SaveConfig { config: next });
                         }
                         if node.has_custom_alias && ui.button("Původní název").clicked() {
                             let matcher = node_to_exact_alias_matcher(node);
@@ -916,12 +1119,67 @@ impl PatchbayState {
                         }
                     }
                 }
+
+                // Seznam aktivních spojení vybraného uzlu (pohodlné odpojení i na touchpadu)
+                let node_links: Vec<_> = graph
+                    .links
+                    .iter()
+                    .filter(|l| l.output_node_id == node.id || l.input_node_id == node.id)
+                    .collect();
+                if !node_links.is_empty() {
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new(format!("Aktivní spojení ({})", node_links.len()))
+                                .size(12.0)
+                                .color(theme::TEXT_MUTED),
+                        );
+                        if node_links.len() > 1 {
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.small_button("Odpojit vše").clicked() {
+                                    for l in &node_links {
+                                        client.send_command(IpcRequest::DestroyLink { link_id: l.id });
+                                    }
+                                }
+                            });
+                        }
+                    });
+                    ui.add_space(4.0);
+                    egui::ScrollArea::vertical()
+                        .max_height(150.0)
+                        .show(ui, |ui| {
+                            for l in &node_links {
+                                let label = if l.output_node_id == node.id {
+                                    format!("-> {}", l.input_label)
+                                } else {
+                                    format!("<- {}", l.output_label)
+                                };
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        egui::RichText::new(truncate_label(&label, 24))
+                                            .size(11.5)
+                                            .color(theme::TEXT_MUTED),
+                                    );
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            if ui.small_button("Odpojit").clicked() {
+                                                client.send_command(IpcRequest::DestroyLink {
+                                                    link_id: l.id,
+                                                });
+                                            }
+                                        },
+                                    );
+                                });
+                            }
+                        });
+                }
             });
 
             ui.add_space(10.0);
             ui.label(
                 egui::RichText::new(
-                    "Tip: Do jednoho modrého vstupního pinu lze míchat více různých zdrojových uzlů najednou. Ze stejného zdrojového uzlu se předchozí link do téhož vstupu automaticky nahradí novým. Pravým kliknutím na drát spojení zrušíš.",
+                    "Ovládání: Přetažením nebo kliknutím na zelený pin pak na modrý propojíš porty. Do jednoho modrého vstupu lze míchat více různých zdrojů (ze stejného zdroje se předchozí link nahradí). Pravý klik na drát nebo Delete odpojí. Pinch / Scroll = zoom, 2 prsty nebo tažení = posun, dvojklik = vycentrovat.",
                 )
                 .color(theme::TEXT_SUBTLE)
                 .size(11.5),

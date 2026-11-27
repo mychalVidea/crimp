@@ -13,6 +13,8 @@ pub struct SavedLayout {
     pub pan: [f32; 2],
     pub zoom: f32,
     pub hide_internal_and_midi: bool,
+    #[serde(default)]
+    pub touchpad_pan: bool,
 }
 
 impl Default for SavedLayout {
@@ -22,6 +24,7 @@ impl Default for SavedLayout {
             pan: [40.0, 40.0],
             zoom: 1.0,
             hide_internal_and_midi: true,
+            touchpad_pan: false,
         }
     }
 }

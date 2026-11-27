@@ -15,6 +15,7 @@ use rules_view::RulesViewState;
 use settings_view::SettingsViewState;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 use tray::WindowWakeGuard;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,6 +36,7 @@ struct CrimpGuiApp {
     settings: SettingsViewState,
     rules: RulesViewState,
     last_feedback: Option<ActionFeedback>,
+    last_feedback_at: Option<Instant>,
 }
 
 impl CrimpGuiApp {
@@ -58,7 +60,13 @@ impl CrimpGuiApp {
             settings: SettingsViewState::default(),
             rules: RulesViewState::default(),
             last_feedback: None,
+            last_feedback_at: None,
         }
+    }
+
+    fn set_feedback(&mut self, fb: ActionFeedback) {
+        self.last_feedback = Some(fb);
+        self.last_feedback_at = Some(Instant::now());
     }
 
     fn reload_rules_and_layout(&mut self) {
@@ -89,7 +97,16 @@ impl eframe::App for CrimpGuiApp {
         }
 
         if let Some(fb) = self.client.drain_feedback() {
-            self.last_feedback = Some(fb);
+            self.set_feedback(fb);
+        }
+        if let Some(fb) = &self.last_feedback
+            && !fb.is_error
+            && self
+                .last_feedback_at
+                .is_some_and(|t| t.elapsed() >= Duration::from_secs(6))
+        {
+            self.last_feedback = None;
+            self.last_feedback_at = None;
         }
 
         egui::Panel::top("crimp_top_bar")
@@ -142,14 +159,14 @@ impl eframe::App for CrimpGuiApp {
                         if ui.button("Spustit daemon").clicked() {
                             match self.client.spawn_background_daemon() {
                                 Ok(()) => {
-                                    self.last_feedback = Some(ActionFeedback {
+                                    self.set_feedback(ActionFeedback {
                                         is_error: false,
                                         message: "Spouštím Crimp daemon...".into(),
                                     });
                                     self.client.refresh_now();
                                 }
                                 Err(message) => {
-                                    self.last_feedback = Some(ActionFeedback {
+                                    self.set_feedback(ActionFeedback {
                                         is_error: true,
                                         message,
                                     });
@@ -207,7 +224,7 @@ impl eframe::App for CrimpGuiApp {
                                     }
                                     Err(err) => {
                                         self.restarting = false;
-                                        self.last_feedback = Some(ActionFeedback {
+                                        self.set_feedback(ActionFeedback {
                                             is_error: true,
                                             message: err,
                                         });
@@ -295,6 +312,7 @@ impl eframe::App for CrimpGuiApp {
                 });
             });
 
+        let mut dismiss_feedback = false;
         if let Some(fb) = &self.last_feedback {
             egui::Panel::bottom("crimp_status_bar")
                 .frame(
@@ -304,13 +322,24 @@ impl eframe::App for CrimpGuiApp {
                         .inner_margin(egui::Margin::symmetric(14, 7)),
                 )
                 .show(ui, |ui| {
-                    let color = if fb.is_error {
-                        theme::DANGER_RED
-                    } else {
-                        theme::ECONOMY_GREEN
-                    };
-                    ui.colored_label(color, &fb.message);
+                    ui.horizontal(|ui| {
+                        let color = if fb.is_error {
+                            theme::DANGER_RED
+                        } else {
+                            theme::ECONOMY_GREEN
+                        };
+                        ui.colored_label(color, &fb.message);
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.small_button("×").on_hover_text("Skrýt zprávu").clicked() {
+                                dismiss_feedback = true;
+                            }
+                        });
+                    });
                 });
+        }
+        if dismiss_feedback {
+            self.last_feedback = None;
+            self.last_feedback_at = None;
         }
 
         egui::CentralPanel::default()
