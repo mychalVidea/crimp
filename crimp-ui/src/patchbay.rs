@@ -1,7 +1,7 @@
 use crate::client::CrimpClient;
 use crate::layout_store::{
-    SavedLayout, arr_to_pos, arr_to_vec, compute_stable_keys, load_saved_layout, pos_to_arr,
-    save_layout, vec_to_arr,
+    SavedLayout, ScrollMode, arr_to_pos, arr_to_vec, compute_stable_keys, load_saved_layout,
+    pos_to_arr, save_layout, vec_to_arr,
 };
 use crate::theme;
 use crimp_proto::config::{AliasRule, Config, DenyRule, NodeMatcher, RouteRule};
@@ -33,7 +33,8 @@ pub struct PatchbayState {
     zoom: f32,
     needs_fit: bool,
     hide_internal_and_midi: bool,
-    touchpad_pan: bool,
+    scroll_mode: ScrollMode,
+    last_wheel_was_point: bool,
     pending_zoom_step: Option<f32>,
     layout_dirty_since: Option<Instant>,
     dragging_link: Option<PendingDragLink>,
@@ -51,7 +52,7 @@ impl Default for PatchbayState {
         let pan = arr_to_vec(saved.pan);
         let zoom = saved.zoom.clamp(ZOOM_MIN, ZOOM_MAX);
         let hide_internal_and_midi = saved.hide_internal_and_midi;
-        let touchpad_pan = saved.touchpad_pan;
+        let scroll_mode = saved.scroll_mode;
         Self {
             positions: HashMap::new(),
             saved,
@@ -59,7 +60,8 @@ impl Default for PatchbayState {
             zoom,
             needs_fit: !has_saved_positions,
             hide_internal_and_midi,
-            touchpad_pan,
+            scroll_mode,
+            last_wheel_was_point: true,
             pending_zoom_step: None,
             layout_dirty_since: None,
             dragging_link: None,
@@ -89,7 +91,7 @@ impl PatchbayState {
         self.saved.pan = vec_to_arr(self.pan);
         self.saved.zoom = self.zoom;
         self.saved.hide_internal_and_midi = self.hide_internal_and_midi;
-        self.saved.touchpad_pan = self.touchpad_pan;
+        self.saved.scroll_mode = self.scroll_mode;
         save_layout(&self.saved);
         self.layout_dirty_since = None;
     }
@@ -101,7 +103,7 @@ impl PatchbayState {
         self.pan = arr_to_vec(self.saved.pan);
         self.zoom = self.saved.zoom.clamp(ZOOM_MIN, ZOOM_MAX);
         self.hide_internal_and_midi = self.saved.hide_internal_and_midi;
-        self.touchpad_pan = self.saved.touchpad_pan;
+        self.scroll_mode = self.saved.scroll_mode;
         self.needs_fit = self.saved.node_positions.is_empty();
         self.layout_dirty_since = None;
     }
@@ -222,25 +224,29 @@ impl PatchbayState {
                 self.mark_dirty();
             }
             if ui
-                .checkbox(&mut self.touchpad_pan, "2 prsty: Posun")
+                .button(self.scroll_mode.label())
                 .on_hover_text(
-                    "Režim pro touchpad: 2 prsty na touchpadu plynule posouvají plátno, Pinch gesto (nebo Ctrl+Scroll) zoomuje.\nKdyž je vypnuto, kolečko myši i vertikální scroll rovnou zoomují (horizontální scroll i Shift+Scroll posouvají).",
+                    "Kliknutím přepneš chování kolečka / touchpadu:\n• Auto: 2 prsty na touchpadu posouvají do všech stran, Ctrl + 2 prsty nebo kolečko myši zoomuje\n• Posun: každý scroll posouvá (zoom přes Ctrl + scroll)\n• Zoom: vertikální scroll zoomuje (posun přes Shift + scroll)",
                 )
-                .changed()
+                .clicked()
             {
+                self.scroll_mode = self.scroll_mode.next();
                 self.mark_dirty();
             }
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
-                    .small_button("+")
-                    .on_hover_text("Přiblížit (+)")
+                    .add(egui::Button::new("+").min_size(egui::vec2(26.0, 22.0)))
+                    .on_hover_text("Přiblížit (+ nebo Ctrl + 2 prsty)")
                     .clicked()
                 {
                     self.pending_zoom_step = Some(1.16);
                 }
                 if ui
-                    .small_button(format!("{:.0}%", self.zoom * 100.0))
+                    .add(
+                        egui::Button::new(format!("{:.0}%", self.zoom * 100.0))
+                            .min_size(egui::vec2(46.0, 22.0)),
+                    )
                     .on_hover_text("Kliknutím vycentruješ a přizpůsobíš graf na okno (F / 0)")
                     .clicked()
                 {
@@ -248,8 +254,8 @@ impl PatchbayState {
                     self.mark_dirty();
                 }
                 if ui
-                    .small_button("−")
-                    .on_hover_text("Oddálit (-)")
+                    .add(egui::Button::new("−").min_size(egui::vec2(26.0, 22.0)))
+                    .on_hover_text("Oddálit (- nebo Ctrl + 2 prsty)")
                     .clicked()
                 {
                     self.pending_zoom_step = Some(1.0 / 1.16);
@@ -442,28 +448,38 @@ impl PatchbayState {
             latest_pos.is_some_and(|p| canvas_rect.contains(p)) || canvas_resp.hovered();
 
         if pointer_in_canvas {
-            // Touchpad Pinch-to-Zoom (`PinchGesture`), dotykový pinch i `Ctrl + Scroll`
+            ui.input(|i| {
+                for ev in &i.events {
+                    if let egui::Event::MouseWheel { unit, .. } = ev {
+                        self.last_wheel_was_point = *unit == egui::MouseWheelUnit::Point;
+                    }
+                }
+            });
+
+            // Ctrl + 2 prsty na touchpadu, Ctrl + kolečko myši, případně platformní Pinch
             let pinch_zoom = ui.input(|i| i.zoom_delta());
             if (pinch_zoom - 1.0).abs() > 0.0005 {
                 self.apply_zoom_at(canvas_rect, self.zoom * pinch_zoom, latest_pos);
             }
 
-            // Kolečko myši / 2-prstý scroll na touchpadu / Shift+Scroll posun
+            // Touchpad 2-prstý posun (Point) vs kolečko myši (Line)
             let scroll = ui.input(|i| i.smooth_scroll_delta);
             if scroll != Vec2::ZERO {
                 let shift = ui.input(|i| i.modifiers.shift);
-                if self.touchpad_pan || shift {
+                let should_pan = match self.scroll_mode {
+                    ScrollMode::Auto => self.last_wheel_was_point || shift,
+                    ScrollMode::Pan => true,
+                    ScrollMode::Zoom => shift,
+                };
+                if should_pan {
                     self.pan += scroll;
                     self.mark_dirty();
-                } else {
-                    if scroll.y.abs() > 0.1 {
-                        let factor = (scroll.y * 0.0022).exp().clamp(0.75, 1.35);
-                        self.apply_zoom_at(canvas_rect, self.zoom * factor, latest_pos);
-                    }
-                    if scroll.x.abs() > 0.1 {
-                        self.pan.x += scroll.x;
-                        self.mark_dirty();
-                    }
+                } else if scroll.x.abs() > scroll.y.abs() * 1.5 {
+                    self.pan.x += scroll.x;
+                    self.mark_dirty();
+                } else if scroll.y.abs() > 0.1 {
+                    let factor = (scroll.y * 0.0022).exp().clamp(0.75, 1.35);
+                    self.apply_zoom_at(canvas_rect, self.zoom * factor, latest_pos);
                 }
             }
         }
@@ -1179,7 +1195,7 @@ impl PatchbayState {
             ui.add_space(10.0);
             ui.label(
                 egui::RichText::new(
-                    "Ovládání: Přetažením nebo kliknutím na zelený pin pak na modrý propojíš porty. Do jednoho modrého vstupu lze míchat více různých zdrojů (ze stejného zdroje se předchozí link nahradí). Pravý klik na drát nebo Delete odpojí. Pinch / Scroll = zoom, 2 prsty nebo tažení = posun, dvojklik = vycentrovat.",
+                    "Ovládání: Přetažením nebo kliknutím na zelený pin pak na modrý propojíš porty. Do jednoho modrého vstupu lze míchat více zdrojů (ze stejného zdroje se předchozí link nahradí). Pravý klik na drát nebo Delete odpojí. Touchpad: 2 prsty = posun do stran, Ctrl + 2 prsty (nebo +/−) = zoom, kolečko myši = zoom, dvojklik = vycentrovat.",
                 )
                 .color(theme::TEXT_SUBTLE)
                 .size(11.5),

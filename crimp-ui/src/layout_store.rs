@@ -5,6 +5,38 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::PathBuf;
 
+/// Jak má fungovat kolečko myši a 2-prstý scroll na touchpadu v Patchbayi.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum ScrollMode {
+    /// Touchpad (`Point`) posouvá plátno do všech stran, kolečko myši (`Line`) a `Ctrl+Scroll` zoomují.
+    #[default]
+    Auto,
+    /// Jakýkoliv scroll bez `Ctrl` posouvá plátno do všech stran; `Ctrl+Scroll` zoomuje.
+    Pan,
+    /// Vertikální scroll zoomuje, horizontální nebo `Shift+Scroll` posouvá.
+    Zoom,
+}
+
+impl ScrollMode {
+    #[must_use]
+    pub fn next(self) -> Self {
+        match self {
+            Self::Auto => Self::Pan,
+            Self::Pan => Self::Zoom,
+            Self::Zoom => Self::Auto,
+        }
+    }
+
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "Scroll: Auto",
+            Self::Pan => "Scroll: Posun",
+            Self::Zoom => "Scroll: Zoom",
+        }
+    }
+}
+
 /// Uložený stav uživatelského rozvržení Patchbay plátna (`~/.config/crimp/ui-layout.json`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -14,7 +46,7 @@ pub struct SavedLayout {
     pub zoom: f32,
     pub hide_internal_and_midi: bool,
     #[serde(default)]
-    pub touchpad_pan: bool,
+    pub scroll_mode: ScrollMode,
 }
 
 impl Default for SavedLayout {
@@ -24,7 +56,7 @@ impl Default for SavedLayout {
             pan: [40.0, 40.0],
             zoom: 1.0,
             hide_internal_and_midi: true,
-            touchpad_pan: false,
+            scroll_mode: ScrollMode::Auto,
         }
     }
 }
