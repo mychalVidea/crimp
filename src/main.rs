@@ -468,6 +468,22 @@ fn run_daemon(custom_config: Option<PathBuf>, custom_socket: Option<String>) -> 
                     Err(message) => IpcResponse::Error { message },
                 }
             }
+            IpcRequest::SavePwLimits {
+                min_quantum,
+                max_quantum,
+                quantum_limit,
+                allowed_rates,
+            } => {
+                match pw_for_ipc.save_pw_limits(
+                    min_quantum,
+                    max_quantum,
+                    quantum_limit,
+                    allowed_rates,
+                ) {
+                    Ok(message) => IpcResponse::Ok { message },
+                    Err(message) => IpcResponse::Error { message },
+                }
+            }
             IpcRequest::SetDefaultDevice { kind, node_name } => {
                 match pw_for_ipc.set_default_device(kind, node_name) {
                     Ok(message) => IpcResponse::Ok { message },
@@ -510,6 +526,15 @@ fn run_daemon(custom_config: Option<PathBuf>, custom_socket: Option<String>) -> 
                 Some(server)
             }
             Err(err) => {
+                if matches!(err, crimp_proto::ipc::IpcError::AlreadyRunning(_)) {
+                    error!(
+                        error = %err,
+                        "Jiný Crimp daemon již běží na stejném IPC socketu; ukončuji duplicitní instanci"
+                    );
+                    pw_handle.shutdown();
+                    let _ = pw_handle.join();
+                    return ExitCode::FAILURE;
+                }
                 warn!(error = %err, "IPC server se nepodařilo spustit; pokračuji bez IPC");
                 None
             }

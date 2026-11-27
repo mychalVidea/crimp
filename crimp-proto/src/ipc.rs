@@ -43,6 +43,7 @@ pub enum DefaultDeviceKind {
 /// Požadavek zasílaný po lokálním Unix Domain Socketu (`\n`-oddělený JSON).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
+#[allow(clippy::large_enum_variant)]
 pub enum IpcRequest {
     Ping,
     Status,
@@ -62,6 +63,12 @@ pub enum IpcRequest {
         target: MetadataTarget,
         key: String,
         value: Option<String>,
+    },
+    SavePwLimits {
+        min_quantum: Option<u32>,
+        max_quantum: Option<u32>,
+        quantum_limit: Option<u32>,
+        allowed_rates: Option<Vec<u32>>,
     },
     SetDefaultDevice {
         kind: DefaultDeviceKind,
@@ -113,6 +120,7 @@ pub struct DaemonStatus {
 /// Odpověď daemona přes IPC socket.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
+#[allow(clippy::large_enum_variant)]
 pub enum IpcResponse {
     Pong { version: String },
     Status { data: DaemonStatus },
@@ -368,6 +376,25 @@ mod tests {
                 version: "0.2.0-test".into()
             }
         );
+
+        let limits_json = serde_json::to_string(&IpcRequest::SavePwLimits {
+            min_quantum: Some(64),
+            max_quantum: Some(2048),
+            quantum_limit: None,
+            allowed_rates: Some(vec![44100, 48000, 96000]),
+        })
+        .expect("serialize SavePwLimits");
+        let parsed_limits: IpcRequest =
+            serde_json::from_str(&limits_json).expect("deserialize SavePwLimits");
+        assert!(matches!(
+            parsed_limits,
+            IpcRequest::SavePwLimits {
+                min_quantum: Some(64),
+                max_quantum: Some(2048),
+                quantum_limit: None,
+                ..
+            }
+        ));
 
         match send_request(&sock, &IpcRequest::PwSettings).expect("pw settings") {
             IpcResponse::PwSettings { data } => {

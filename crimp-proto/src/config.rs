@@ -363,6 +363,19 @@ impl Config {
     }
 }
 
+/// Naformátuje seznam vzorkovacích frekvencí do PipeWire zápisu (`[ 44100 48000 96000 ]`).
+#[must_use]
+pub fn format_allowed_rates(rates: &[u32]) -> String {
+    format!(
+        "[ {} ]",
+        rates
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(" ")
+    )
+}
+
 /// Zparsuje seznam vzorkovacích frekvencí z formátu PipeWire (`[ 44100 48000 96000 ]` nebo `44100, 48000`).
 pub fn parse_allowed_rates_list(raw: &str) -> Result<Vec<u32>, String> {
     let inner = raw.trim().trim_start_matches('[').trim_end_matches(']');
@@ -674,5 +687,80 @@ mod tests {
             cfg.pw_settings.default_audio_sink.as_deref(),
             Some("alsa_test")
         );
+    }
+
+    #[test]
+    fn save_config_roundtrips_complete_config_with_rules_and_settings() {
+        let mut cfg = Config::default();
+        cfg.dsp.default_quantum = Some(256);
+        cfg.dsp.default_rate = Some(96000);
+        cfg.pw_settings.min_quantum = Some(64);
+        cfg.pw_settings.max_quantum = Some(2048);
+        cfg.pw_settings.allowed_rates = Some(vec![44100, 48000, 96000]);
+        cfg.pw_settings.power_of_two_quantum = Some(true);
+        cfg.pw_settings.default_audio_sink =
+            Some("alsa_output.pci-0000_0c_00.6.analog-stereo".into());
+        cfg.pw_settings.default_audio_source = Some("alsa_input.usb-HyperX.mono-fallback".into());
+        cfg.virtual_sink.push(VirtualSinkRule {
+            name: "crimp_bus".into(),
+            enabled: true,
+            description: Some("Bus".into()),
+            media_class: "Audio/Sink".into(),
+            channels: 2,
+            positions: vec!["FL".into(), "FR".into()],
+        });
+        cfg.deny.push(DenyRule {
+            name: "Block test".into(),
+            enabled: true,
+            source: NodeMatcher {
+                node_name: Some("src".into()),
+                port_name: Some("out".into()),
+                ..Default::default()
+            },
+            target: NodeMatcher {
+                node_name: Some("dst".into()),
+                port_name: Some("in".into()),
+                ..Default::default()
+            },
+        });
+        cfg.route.push(RouteRule {
+            name: "Route test".into(),
+            enabled: true,
+            source: NodeMatcher {
+                node_name: Some("src2".into()),
+                port_name: Some("out2".into()),
+                ..Default::default()
+            },
+            target: NodeMatcher {
+                node_name: Some("dst2".into()),
+                port_name: Some("in2".into()),
+                ..Default::default()
+            },
+            exclusive: false,
+        });
+        cfg.dsp_profile.push(DspProfileRule {
+            name: "Game".into(),
+            enabled: true,
+            source: NodeMatcher {
+                application_name: Some("Game".into()),
+                ..Default::default()
+            },
+            quantum: Some(128),
+            rate: Some(48000),
+            priority: 10,
+        });
+        cfg.alias.push(AliasRule {
+            matcher: NodeMatcher {
+                node_name: Some("alsa_output.pci".into()),
+                ..Default::default()
+            },
+            display_name: "Sluchátka".into(),
+        });
+
+        let tmp = std::env::temp_dir().join(format!("crimp-cfg-rt-{}.toml", std::process::id()));
+        save_config(&tmp, &cfg).expect("save_config must serialize complete config");
+        let reloaded = load_existing(&tmp).expect("load_existing must parse saved config");
+        let _ = fs::remove_file(&tmp);
+        assert_eq!(reloaded, cfg);
     }
 }

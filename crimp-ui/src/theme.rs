@@ -71,7 +71,6 @@ pub fn apply_obsidian_style(ctx: &egui::Context) {
     ctx.set_style_of(egui::Theme::Dark, style);
 }
 
-#[must_use]
 pub fn card_frame() -> Frame {
     Frame::new()
         .fill(SURFACE)

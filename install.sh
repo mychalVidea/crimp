@@ -167,6 +167,10 @@ install_bundle() {
   if command -v systemctl >/dev/null 2>&1 && systemctl --user status >/dev/null 2>&1; then
     systemctl --user daemon-reload
     systemctl --user enable crimp.service >/dev/null 2>&1 || true
+    if ! systemctl --user is-active --quiet crimp.service 2>/dev/null; then
+      "${BIN_DIR}/crimp" shutdown >/dev/null 2>&1 || true
+      sleep 0.3
+    fi
     systemctl --user restart crimp.service
     log "Systemd služba crimp.service byla spuštěna/restartována s novou verzí."
   else

@@ -4,8 +4,8 @@ use crimp_proto::config::Config;
 use crimp_proto::graph::{DeniedRecord, GraphSnapshot, PwRuntimeState};
 use crimp_proto::ipc::{DaemonStatus, IpcRequest, IpcResponse, resolve_socket_path, send_request};
 use crimp_proto::update::{self, UpdateInfo};
-use std::path::PathBuf;
-use std::process::Command;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
@@ -36,7 +36,7 @@ enum ClientMsg {
     RefreshNow,
     SetAutostart(bool),
     Command {
-        req: IpcRequest,
+        req: Box<IpcRequest>,
         feedback_tx: mpsc::Sender<ActionFeedback>,
     },
     Shutdown,
@@ -90,6 +90,14 @@ impl CrimpClient {
         let _ = thread::Builder::new()
             .name("crimp-ui-ipc".into())
             .spawn(move || {
+                if send_request(&sock_bg, &IpcRequest::Ping).is_err()
+                    && (autostart::probe_autostart().daemon_enabled
+                        || crimp_proto::config::default_config_path().is_ok_and(|p| p.exists()))
+                    && ensure_background_daemon_started().is_ok()
+                {
+                    thread::sleep(Duration::from_millis(250));
+                }
+
                 loop {
                     poll_daemon(&sock_bg, &snapshot_bg);
                     ctx_ipc.request_repaint();
@@ -114,7 +122,7 @@ impl CrimpClient {
                             ctx_ipc.request_repaint();
                         }
                         Ok(ClientMsg::Command { req, feedback_tx }) => {
-                            let res = match send_request(&sock_bg, &req) {
+                            let res = match send_request(&sock_bg, req.as_ref()) {
                                 Ok(IpcResponse::Ok { message }) => ActionFeedback {
                                     is_error: false,
                                     message,
@@ -306,27 +314,35 @@ impl CrimpClient {
 
     pub fn send_command(&self, req: IpcRequest) {
         let _ = self.msg_tx.send(ClientMsg::Command {
-            req,
+            req: Box::new(req),
             feedback_tx: self.feedback_tx.clone(),
         });
+    }
+
+    pub fn push_feedback(&self, is_error: bool, message: impl Into<String>) {
+        let _ = self.feedback_tx.send(ActionFeedback {
+            is_error,
+            message: message.into(),
+        });
+        self.ctx.request_repaint();
     }
 
     #[must_use]
     pub fn drain_feedback(&self) -> Option<ActionFeedback> {
         let mut latest = None;
+        let mut latest_error = None;
         while let Ok(item) = self.feedback_rx.try_recv() {
-            latest = Some(item);
+            if item.is_error {
+                latest_error = Some(item);
+            } else {
+                latest = Some(item);
+            }
         }
-        latest
+        latest_error.or(latest)
     }
 
     pub fn spawn_background_daemon(&self) -> Result<(), String> {
-        let binary = update::resolve_live_binary("crimp");
-        Command::new(&binary)
-            .arg("daemon")
-            .spawn()
-            .map(|_| ())
-            .map_err(|e| format!("Nelze spustit '{}': {e}", binary.display()))
+        ensure_background_daemon_started()
     }
 
     pub fn restart_gui_process(&self) -> Result<(), String> {
@@ -347,7 +363,37 @@ impl Drop for CrimpClient {
     }
 }
 
-fn poll_daemon(socket_path: &PathBuf, out: &Arc<Mutex<UiSnapshot>>) {
+fn ensure_background_daemon_started() -> Result<(), String> {
+    let systemd_unit_exists = Command::new("systemctl")
+        .args(["--user", "cat", "crimp.service"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+
+    if systemd_unit_exists
+        && Command::new("systemctl")
+            .args(["--user", "start", "crimp.service"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    {
+        return Ok(());
+    }
+
+    let binary = update::resolve_live_binary("crimp");
+    Command::new(&binary)
+        .arg("daemon")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("Nelze spustit '{}': {e}", binary.display()))
+}
+
+fn poll_daemon(socket_path: &Path, out: &Arc<Mutex<UiSnapshot>>) {
     let status = match send_request(socket_path, &IpcRequest::Status) {
         Ok(IpcResponse::Status { data }) => data,
         Ok(IpcResponse::Error { message }) => {

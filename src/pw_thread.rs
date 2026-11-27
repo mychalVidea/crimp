@@ -31,8 +31,10 @@ use thiserror::Error;
 use tracing::{debug, error, info, warn};
 
 const MAX_DENIED_HISTORY: usize = 128;
-const HOT_RELOAD_INTERVAL: Duration = Duration::from_secs(2);
+const HOT_RELOAD_INTERVAL: Duration = Duration::from_millis(1200);
 const IN_FLIGHT_LINK_TTL: Duration = Duration::from_secs(4);
+const RESYNC_COOLDOWN: Duration = Duration::from_millis(450);
+const STARTUP_DEFAULT_WINDOW: Duration = Duration::from_secs(6);
 
 #[derive(Debug, Error)]
 pub enum PwError {
@@ -72,6 +74,13 @@ pub enum PwCommand {
         target: MetadataTarget,
         key: String,
         value: Option<String>,
+        reply: mpsc::SyncSender<Result<String, String>>,
+    },
+    SavePwLimits {
+        min_quantum: Option<u32>,
+        max_quantum: Option<u32>,
+        quantum_limit: Option<u32>,
+        allowed_rates: Option<Vec<u32>>,
         reply: mpsc::SyncSender<Result<String, String>>,
     },
     SetDefaultDevice {
@@ -191,6 +200,25 @@ impl PwHandle {
         })?;
         rx.recv_timeout(Duration::from_secs(3))
             .map_err(|e| format!("Vypršel timeout při úpravě PipeWire nastavení: {e}"))?
+    }
+
+    pub fn save_pw_limits(
+        &self,
+        min_quantum: Option<u32>,
+        max_quantum: Option<u32>,
+        quantum_limit: Option<u32>,
+        allowed_rates: Option<Vec<u32>>,
+    ) -> Result<String, String> {
+        let (tx, rx) = mpsc::sync_channel(1);
+        self.send_command(PwCommand::SavePwLimits {
+            min_quantum,
+            max_quantum,
+            quantum_limit,
+            allowed_rates,
+            reply: tx,
+        })?;
+        rx.recv_timeout(Duration::from_secs(3))
+            .map_err(|e| format!("Vypršel timeout při ukládání PipeWire limitů: {e}"))?
     }
 
     pub fn set_default_device(
@@ -324,6 +352,14 @@ struct DaemonState {
     last_applied_quantum: Option<u32>,
     last_applied_rate: Option<u32>,
     last_applied_pw_settings: PwSettingsConfig,
+    last_applied_default_sink: Option<String>,
+    last_applied_default_source: Option<String>,
+    pending_default_sink_sync: bool,
+    pending_default_source_sync: bool,
+    started_at: Instant,
+    last_pw_settings_sync_at: Option<Instant>,
+    last_dsp_sync_at: Option<Instant>,
+    last_default_sync_at: Option<Instant>,
     denied_history: VecDeque<DeniedRecord>,
     blocked_total: u64,
     routes_applied_total: u64,
@@ -339,6 +375,8 @@ impl DaemonState {
         runtime: Rc<RefCell<PwRuntimeState>>,
     ) -> Self {
         let mtime = fs::metadata(&config_path).and_then(|m| m.modified()).ok();
+        let pending_default_sink_sync = initial_config.pw_settings.default_audio_sink.is_some();
+        let pending_default_source_sync = initial_config.pw_settings.default_audio_source.is_some();
 
         Self {
             config_path,
@@ -363,6 +401,14 @@ impl DaemonState {
             last_applied_quantum: None,
             last_applied_rate: None,
             last_applied_pw_settings: PwSettingsConfig::default(),
+            last_applied_default_sink: None,
+            last_applied_default_source: None,
+            pending_default_sink_sync,
+            pending_default_source_sync,
+            started_at: Instant::now(),
+            last_pw_settings_sync_at: None,
+            last_dsp_sync_at: None,
+            last_default_sync_at: None,
             denied_history: VecDeque::with_capacity(MAX_DENIED_HISTORY),
             blocked_total: 0,
             routes_applied_total: 0,
@@ -408,6 +454,7 @@ impl DaemonState {
                     self.graph.upsert_node(info);
                     self.enforce_all_links();
                     self.reconcile_routes();
+                    self.reconcile_default_devices();
                     self.reconcile_dsp();
                 }
             }
@@ -1012,43 +1059,57 @@ impl DaemonState {
 
         let target = self.engine.config().pw_settings.clone();
         let prev = &self.last_applied_pw_settings;
+        let rt = self.runtime.borrow().clone();
+        let allow_resync = self
+            .last_pw_settings_sync_at
+            .is_none_or(|t| t.elapsed() >= RESYNC_COOLDOWN);
+        let mut wrote_any = false;
 
-        apply_u32_setting(
+        wrote_any |= reconcile_u32_setting(
             metadata,
             "clock.min-quantum",
             target.min_quantum,
             prev.min_quantum,
+            rt.clock_min_quantum.as_deref(),
+            allow_resync,
         );
-        apply_u32_setting(
+        wrote_any |= reconcile_u32_setting(
             metadata,
             "clock.max-quantum",
             target.max_quantum,
             prev.max_quantum,
+            rt.clock_max_quantum.as_deref(),
+            allow_resync,
         );
-        apply_u32_setting(
+        wrote_any |= reconcile_u32_setting(
             metadata,
             "clock.quantum-limit",
             target.quantum_limit,
             prev.quantum_limit,
+            rt.clock_quantum_limit.as_deref(),
+            allow_resync,
         );
-        apply_u32_setting(
+        wrote_any |= reconcile_u32_setting(
             metadata,
             "clock.quantum-floor",
             target.quantum_floor,
             prev.quantum_floor,
+            rt.clock_quantum_floor.as_deref(),
+            allow_resync,
         );
 
-        if target.allowed_rates != prev.allowed_rates {
+        let observed_rates = rt
+            .clock_allowed_rates
+            .as_deref()
+            .and_then(|s| config::parse_allowed_rates_list(s).ok());
+        if target.allowed_rates != prev.allowed_rates
+            || (allow_resync
+                && target.allowed_rates.is_some()
+                && observed_rates != target.allowed_rates)
+        {
             match &target.allowed_rates {
                 Some(rates) => {
-                    let formatted = format!(
-                        "[ {} ]",
-                        rates
-                            .iter()
-                            .map(u32::to_string)
-                            .collect::<Vec<_>>()
-                            .join(" ")
-                    );
+                    let formatted = config::format_allowed_rates(rates);
                     metadata.set_property(
                         0,
                         "clock.allowed-rates",
@@ -1056,15 +1117,22 @@ impl DaemonState {
                         Some(&formatted),
                     );
                     info!(allowed_rates = %formatted, "Nastaveno PipeWire clock.allowed-rates");
+                    wrote_any = true;
                 }
                 None if prev.allowed_rates.is_some() => {
                     metadata.set_property(0, "clock.allowed-rates", None, None);
+                    wrote_any = true;
                 }
                 None => {}
             }
         }
 
-        if target.power_of_two_quantum != prev.power_of_two_quantum {
+        let observed_pow2 = rt.clock_power_of_two.as_deref().and_then(parse_pw_bool);
+        if target.power_of_two_quantum != prev.power_of_two_quantum
+            || (allow_resync
+                && target.power_of_two_quantum.is_some()
+                && observed_pow2 != target.power_of_two_quantum)
+        {
             match target.power_of_two_quantum {
                 Some(b) => {
                     let s = if b { "true" } else { "false" };
@@ -1074,37 +1142,98 @@ impl DaemonState {
                         Some("Spa:String"),
                         Some(s),
                     );
+                    wrote_any = true;
                 }
                 None if prev.power_of_two_quantum.is_some() => {
                     metadata.set_property(0, "clock.power-of-two-quantum", None, None);
+                    wrote_any = true;
                 }
                 None => {}
             }
         }
 
-        if target.log_level != prev.log_level {
+        let observed_log_level =
+            parse_u32(rt.log_level.as_deref()).and_then(|v| u8::try_from(v).ok());
+        if target.log_level != prev.log_level
+            || (allow_resync
+                && target.log_level.is_some()
+                && observed_log_level != target.log_level)
+        {
             match target.log_level {
                 Some(lvl) => {
                     let val = lvl.to_string();
                     metadata.set_property(0, "log.level", Some("Spa:String"), Some(&val));
+                    wrote_any = true;
                 }
                 None if prev.log_level.is_some() => {
                     metadata.set_property(0, "log.level", None, None);
+                    wrote_any = true;
                 }
                 None => {}
             }
         }
 
         self.last_applied_pw_settings = target;
+        if wrote_any {
+            self.last_pw_settings_sync_at = Some(Instant::now());
+        }
     }
 
     fn reconcile_default_devices(&mut self) {
-        let cfg = &self.engine.config().pw_settings;
-        if let Some(sink) = cfg.default_audio_sink.clone() {
-            let _ = self.set_default_device(DefaultDeviceKind::Sink, Some(sink));
-        }
-        if let Some(src) = cfg.default_audio_source.clone() {
-            let _ = self.set_default_device(DefaultDeviceKind::Source, Some(src));
+        let Some(meta) = &self.default_metadata else {
+            return;
+        };
+        let rt = self.runtime.borrow().clone();
+        let startup_window = self.started_at.elapsed() < STARTUP_DEFAULT_WINDOW;
+        let allow_resync = self
+            .last_default_sync_at
+            .is_none_or(|t| t.elapsed() >= RESYNC_COOLDOWN);
+        let desired_sink = self.engine.config().pw_settings.default_audio_sink.clone();
+        let desired_source = self
+            .engine
+            .config()
+            .pw_settings
+            .default_audio_source
+            .clone();
+        let sink_present = desired_sink.as_deref().is_some_and(|name| {
+            self.graph
+                .nodes()
+                .any(|n| n.node_name.as_deref() == Some(name))
+        });
+        let source_present = desired_source.as_deref().is_some_and(|name| {
+            self.graph
+                .nodes()
+                .any(|n| n.node_name.as_deref() == Some(name))
+        });
+
+        let mut wrote_any = false;
+        wrote_any |= reconcile_default_slot(
+            meta,
+            DefaultDeviceKind::Sink,
+            desired_sink,
+            &mut self.last_applied_default_sink,
+            &mut self.pending_default_sink_sync,
+            rt.default_audio_sink.as_deref(),
+            rt.default_configured_sink.as_deref(),
+            sink_present,
+            startup_window,
+            allow_resync,
+        );
+        wrote_any |= reconcile_default_slot(
+            meta,
+            DefaultDeviceKind::Source,
+            desired_source,
+            &mut self.last_applied_default_source,
+            &mut self.pending_default_source_sync,
+            rt.default_audio_source.as_deref(),
+            rt.default_configured_source.as_deref(),
+            source_present,
+            startup_window,
+            allow_resync,
+        );
+
+        if wrote_any {
+            self.last_default_sync_at = Some(Instant::now());
         }
     }
 
@@ -1148,43 +1277,6 @@ impl DaemonState {
         })
     }
 
-    fn set_default_device(
-        &self,
-        kind: DefaultDeviceKind,
-        node_name: Option<String>,
-    ) -> Result<String, String> {
-        let meta = self
-            .default_metadata
-            .as_ref()
-            .ok_or_else(|| "PipeWire metadata 'default' není připojeno".to_string())?;
-
-        let (key, configured_key) = match kind {
-            DefaultDeviceKind::Sink => ("default.audio.sink", "default.configured.audio.sink"),
-            DefaultDeviceKind::Source => {
-                ("default.audio.source", "default.configured.audio.source")
-            }
-        };
-
-        match node_name
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-        {
-            Some(name) => {
-                let json = serde_json::json!({ "name": name }).to_string();
-                meta.set_property(0, configured_key, Some("Spa:String:JSON"), Some(&json));
-                meta.set_property(0, key, Some("Spa:String:JSON"), Some(&json));
-                info!(key, node_name = %name, "Nastaveno výchozí PipeWire zařízení");
-                Ok(format!("{key} -> {name}"))
-            }
-            None => {
-                meta.set_property(0, configured_key, None, None);
-                meta.set_property(0, key, None, None);
-                info!(key, "Obnoveno automatické výchozí PipeWire zařízení");
-                Ok(format!("{key} resetováno na auto"))
-            }
-        }
-    }
-
     fn reconcile_dsp(&mut self) {
         let Some(metadata) = &self.settings_metadata else {
             return;
@@ -1195,8 +1287,17 @@ impl DaemonState {
             self.manual_quantum_override,
             self.manual_rate_override,
         );
+        let rt = self.runtime.borrow().clone();
+        let allow_resync = self
+            .last_dsp_sync_at
+            .is_none_or(|t| t.elapsed() >= RESYNC_COOLDOWN);
+        let observed_q = parse_positive_u32(rt.clock_force_quantum.as_deref());
+        let observed_r = parse_positive_u32(rt.clock_force_rate.as_deref());
+        let mut wrote_any = false;
 
-        if target.quantum != self.last_applied_quantum {
+        if target.quantum != self.last_applied_quantum
+            || (allow_resync && target.quantum.is_some() && observed_q != target.quantum)
+        {
             match target.quantum {
                 Some(q) => {
                     let val = q.to_string();
@@ -1207,17 +1308,21 @@ impl DaemonState {
                         "Aplikováno PipeWire clock.force-quantum"
                     );
                     self.last_applied_quantum = Some(q);
+                    wrote_any = true;
                 }
                 None if self.last_applied_quantum.is_some() => {
                     metadata.set_property(0, "clock.force-quantum", None, None);
                     info!("Vráceno PipeWire clock.force-quantum na výchozí (auto)");
                     self.last_applied_quantum = None;
+                    wrote_any = true;
                 }
                 None => {}
             }
         }
 
-        if target.rate != self.last_applied_rate {
+        if target.rate != self.last_applied_rate
+            || (allow_resync && target.rate.is_some() && observed_r != target.rate)
+        {
             match target.rate {
                 Some(r) => {
                     let val = r.to_string();
@@ -1228,19 +1333,27 @@ impl DaemonState {
                         "Aplikováno PipeWire clock.force-rate"
                     );
                     self.last_applied_rate = Some(r);
+                    wrote_any = true;
                 }
                 None if self.last_applied_rate.is_some() => {
                     metadata.set_property(0, "clock.force-rate", None, None);
                     info!("Vráceno PipeWire clock.force-rate na výchozí (auto)");
                     self.last_applied_rate = None;
+                    wrote_any = true;
                 }
                 None => {}
             }
+        }
+
+        if wrote_any {
+            self.last_dsp_sync_at = Some(Instant::now());
         }
     }
 
     fn apply_config_and_sync(&mut self, cfg: Config, new_mtime: Option<SystemTime>) -> String {
         self.last_config_mtime = new_mtime;
+        self.pending_default_sink_sync = cfg.pw_settings.default_audio_sink.is_some();
+        self.pending_default_source_sync = cfg.pw_settings.default_audio_source.is_some();
         self.engine.update_config(cfg);
         self.sync_virtual_sinks();
         self.enforce_all_links();
@@ -1257,6 +1370,13 @@ impl DaemonState {
             c.route.len(),
             c.dsp_profile.len(),
         )
+    }
+
+    fn periodic_sync(&mut self) {
+        let _ = self.reload_from_disk_if_changed(false);
+        self.reconcile_pw_settings();
+        self.reconcile_default_devices();
+        self.reconcile_dsp();
     }
 
     fn reload_from_disk_if_changed(&mut self, force: bool) -> Result<String, String> {
@@ -1334,13 +1454,44 @@ impl DaemonState {
 
     fn cleanup_on_shutdown(&mut self) {
         if let Some(metadata) = &self.settings_metadata {
-            if self.last_applied_quantum.is_some() {
-                metadata.set_property(0, "clock.force-quantum", None, None);
-                self.last_applied_quantum = None;
+            let dsp_cfg = &self.engine.config().dsp;
+            match dsp_cfg.default_quantum {
+                Some(persistent_q) => {
+                    if self.last_applied_quantum != Some(persistent_q) {
+                        let val = persistent_q.to_string();
+                        metadata.set_property(
+                            0,
+                            "clock.force-quantum",
+                            Some("Spa:String"),
+                            Some(&val),
+                        );
+                    }
+                }
+                None => {
+                    if self.last_applied_quantum.is_some() {
+                        metadata.set_property(0, "clock.force-quantum", None, None);
+                        self.last_applied_quantum = None;
+                    }
+                }
             }
-            if self.last_applied_rate.is_some() {
-                metadata.set_property(0, "clock.force-rate", None, None);
-                self.last_applied_rate = None;
+            match dsp_cfg.default_rate {
+                Some(persistent_r) => {
+                    if self.last_applied_rate != Some(persistent_r) {
+                        let val = persistent_r.to_string();
+                        metadata.set_property(
+                            0,
+                            "clock.force-rate",
+                            Some("Spa:String"),
+                            Some(&val),
+                        );
+                    }
+                }
+                None => {
+                    if self.last_applied_rate.is_some() {
+                        metadata.set_property(0, "clock.force-rate", None, None);
+                        self.last_applied_rate = None;
+                    }
+                }
             }
         }
 
@@ -1352,21 +1503,103 @@ impl DaemonState {
     }
 }
 
-fn apply_u32_setting(metadata: &Metadata, key: &str, desired: Option<u32>, prev: Option<u32>) {
-    if desired == prev {
-        return;
+fn apply_default_device_metadata(
+    meta: &Metadata,
+    kind: DefaultDeviceKind,
+    node_name: Option<&str>,
+) {
+    let (key, configured_key) = match kind {
+        DefaultDeviceKind::Sink => ("default.audio.sink", "default.configured.audio.sink"),
+        DefaultDeviceKind::Source => ("default.audio.source", "default.configured.audio.source"),
+    };
+
+    match node_name.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(name) => {
+            let json = serde_json::json!({ "name": name }).to_string();
+            meta.set_property(0, configured_key, Some("Spa:String:JSON"), Some(&json));
+            meta.set_property(0, key, Some("Spa:String:JSON"), Some(&json));
+            info!(key, node_name = %name, "Nastaveno výchozí PipeWire zařízení");
+        }
+        None => {
+            meta.set_property(0, configured_key, None, None);
+            meta.set_property(0, key, None, None);
+            info!(key, "Obnoveno automatické výchozí PipeWire zařízení");
+        }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn reconcile_default_slot(
+    meta: &Metadata,
+    kind: DefaultDeviceKind,
+    desired: Option<String>,
+    last_applied: &mut Option<String>,
+    pending_sync: &mut bool,
+    observed_active: Option<&str>,
+    observed_configured: Option<&str>,
+    node_present: bool,
+    startup_window: bool,
+    allow_resync: bool,
+) -> bool {
     match desired {
-        Some(v) => {
-            let s = v.to_string();
-            metadata.set_property(0, key, Some("Spa:String"), Some(&s));
-            info!(key, value = v, "Aplikováno PipeWire nastavení");
+        Some(name) => {
+            let active_matches = observed_active == Some(name.as_str())
+                && observed_configured == Some(name.as_str());
+            let config_changed = last_applied.as_deref() != Some(name.as_str());
+            let wrote = if config_changed
+                || ((*pending_sync || startup_window) && !active_matches && allow_resync)
+            {
+                apply_default_device_metadata(meta, kind, Some(&name));
+                *last_applied = Some(name);
+                true
+            } else {
+                false
+            };
+            if node_present && active_matches && !startup_window {
+                *pending_sync = false;
+            }
+            wrote
         }
-        None if prev.is_some() => {
-            metadata.set_property(0, key, None, None);
-            info!(key, "Vráceno PipeWire nastavení na výchozí");
+        None => {
+            let wrote = if last_applied.is_some() {
+                apply_default_device_metadata(meta, kind, None);
+                *last_applied = None;
+                true
+            } else {
+                false
+            };
+            *pending_sync = false;
+            wrote
         }
-        None => {}
+    }
+}
+
+fn reconcile_u32_setting(
+    metadata: &Metadata,
+    key: &str,
+    desired: Option<u32>,
+    prev: Option<u32>,
+    observed_raw: Option<&str>,
+    allow_resync: bool,
+) -> bool {
+    let observed = parse_u32(observed_raw);
+    if desired != prev || (allow_resync && desired.is_some() && observed != desired) {
+        match desired {
+            Some(v) => {
+                let s = v.to_string();
+                metadata.set_property(0, key, Some("Spa:String"), Some(&s));
+                info!(key, value = v, "Aplikováno PipeWire nastavení");
+                true
+            }
+            None if prev.is_some() => {
+                metadata.set_property(0, key, None, None);
+                info!(key, "Vráceno PipeWire nastavení na výchozí");
+                true
+            }
+            None => false,
+        }
+    } else {
+        false
     }
 }
 
@@ -1590,26 +1823,31 @@ fn run_single_pipewire_session(
                 .active_profile
                 .is_some();
 
+            let prev_manual_q = st.manual_quantum_override;
+            let prev_manual_r = st.manual_rate_override;
+            let mut next_manual_q = prev_manual_q;
+            let mut next_manual_r = prev_manual_r;
+
             match quantum {
                 DspOverrideChange::Keep => {}
                 DspOverrideChange::Clear => {
-                    st.manual_quantum_override = None;
+                    next_manual_q = None;
                     next_cfg.dsp.default_quantum = None;
                 }
                 DspOverrideChange::Set(q) => {
                     next_cfg.dsp.default_quantum = Some(q);
-                    st.manual_quantum_override = if profile_active { Some(q) } else { None };
+                    next_manual_q = if profile_active { Some(q) } else { None };
                 }
             }
             match rate {
                 DspOverrideChange::Keep => {}
                 DspOverrideChange::Clear => {
-                    st.manual_rate_override = None;
+                    next_manual_r = None;
                     next_cfg.dsp.default_rate = None;
                 }
                 DspOverrideChange::Set(r) => {
                     next_cfg.dsp.default_rate = Some(r);
-                    st.manual_rate_override = if profile_active { Some(r) } else { None };
+                    next_manual_r = if profile_active { Some(r) } else { None };
                 }
             }
 
@@ -1617,7 +1855,12 @@ fn run_single_pipewire_session(
                 let _ = reply.send(Err(err.to_string()));
                 return;
             }
+            st.manual_quantum_override = next_manual_q;
+            st.manual_rate_override = next_manual_r;
+            st.last_dsp_sync_at = None;
             if let Err(err) = st.save_and_apply_config(next_cfg) {
+                st.manual_quantum_override = prev_manual_q;
+                st.manual_rate_override = prev_manual_r;
                 let _ = reply.send(Err(err));
                 return;
             }
@@ -1635,20 +1878,75 @@ fn run_single_pipewire_session(
             reply,
         } => {
             let mut st = state_cmd.borrow_mut();
-            let res = match st.set_pw_setting_live(target, &key, value.as_deref()) {
-                Ok(live_msg) => {
+            let clean_key = key.trim().to_string();
+            let res = if !is_allowed_metadata_key(target, &clean_key) {
+                Err(format!(
+                    "Nepodporovaný nebo nepovolený klíč metadata '{clean_key}'"
+                ))
+            } else {
+                let has_target = match target {
+                    MetadataTarget::Settings => st.settings_metadata.is_some(),
+                    MetadataTarget::Default => st.default_metadata.is_some(),
+                };
+                if !has_target {
+                    Err(match target {
+                        MetadataTarget::Settings => {
+                            "PipeWire metadata 'settings' není připojeno".to_string()
+                        }
+                        MetadataTarget::Default => {
+                            "PipeWire metadata 'default' není připojeno".to_string()
+                        }
+                    })
+                } else {
                     let mut next_cfg = st.engine.config().clone();
-                    match next_cfg.apply_metadata_override(&key, value.as_deref()) {
-                        Ok(true) => match st.save_and_apply_config(next_cfg) {
-                            Ok(_) => Ok(format!("{live_msg} (uloženo do rules.toml)")),
-                            Err(err) => Err(err),
-                        },
-                        Ok(false) => Ok(live_msg),
+                    match next_cfg.apply_metadata_override(&clean_key, value.as_deref()) {
+                        Ok(true) => {
+                            st.last_pw_settings_sync_at = None;
+                            st.last_dsp_sync_at = None;
+                            st.last_default_sync_at = None;
+                            match st.save_and_apply_config(next_cfg) {
+                                Ok(_) => {
+                                    let msg = match value
+                                        .as_deref()
+                                        .map(str::trim)
+                                        .filter(|s| !s.is_empty())
+                                    {
+                                        Some(v) => {
+                                            format!("{clean_key} = {v} (uloženo do rules.toml)")
+                                        }
+                                        None => format!(
+                                            "{clean_key} resetováno na auto (uloženo do rules.toml)"
+                                        ),
+                                    };
+                                    Ok(msg)
+                                }
+                                Err(err) => Err(err),
+                            }
+                        }
+                        Ok(false) => st.set_pw_setting_live(target, &clean_key, value.as_deref()),
                         Err(err) => Err(err),
                     }
                 }
-                Err(err) => Err(err),
             };
+            let _ = reply.send(res);
+        }
+        PwCommand::SavePwLimits {
+            min_quantum,
+            max_quantum,
+            quantum_limit,
+            allowed_rates,
+            reply,
+        } => {
+            let mut st = state_cmd.borrow_mut();
+            let mut next_cfg = st.engine.config().clone();
+            next_cfg.pw_settings.min_quantum = min_quantum;
+            next_cfg.pw_settings.max_quantum = max_quantum;
+            next_cfg.pw_settings.quantum_limit = quantum_limit;
+            next_cfg.pw_settings.allowed_rates = allowed_rates;
+            st.last_pw_settings_sync_at = None;
+            let res = st
+                .save_and_apply_config(next_cfg)
+                .map(|_| "PipeWire limity uloženy do rules.toml a aktivovány".to_string());
             let _ = reply.send(res);
         }
         PwCommand::SetDefaultDevice {
@@ -1657,26 +1955,35 @@ fn run_single_pipewire_session(
             reply,
         } => {
             let mut st = state_cmd.borrow_mut();
-            let res = match st.set_default_device(kind, node_name.clone()) {
-                Ok(live_msg) => {
-                    let mut next_cfg = st.engine.config().clone();
-                    let cleaned = node_name
-                        .map(|s| s.trim().to_string())
-                        .filter(|s| !s.is_empty());
-                    match kind {
-                        DefaultDeviceKind::Sink => {
-                            next_cfg.pw_settings.default_audio_sink = cleaned
-                        }
-                        DefaultDeviceKind::Source => {
-                            next_cfg.pw_settings.default_audio_source = cleaned;
-                        }
+            let res = if st.default_metadata.is_none() {
+                Err("PipeWire metadata 'default' není připojeno".to_string())
+            } else {
+                let mut next_cfg = st.engine.config().clone();
+                let cleaned = node_name
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty());
+                match kind {
+                    DefaultDeviceKind::Sink => {
+                        next_cfg.pw_settings.default_audio_sink = cleaned.clone();
                     }
-                    match st.save_and_apply_config(next_cfg) {
-                        Ok(_) => Ok(format!("{live_msg} (uloženo do rules.toml)")),
-                        Err(err) => Err(err),
+                    DefaultDeviceKind::Source => {
+                        next_cfg.pw_settings.default_audio_source = cleaned.clone();
                     }
                 }
-                Err(err) => Err(err),
+                st.last_default_sync_at = None;
+                match st.save_and_apply_config(next_cfg) {
+                    Ok(_) => {
+                        let key = match kind {
+                            DefaultDeviceKind::Sink => "default.audio.sink",
+                            DefaultDeviceKind::Source => "default.audio.source",
+                        };
+                        Ok(match cleaned {
+                            Some(name) => format!("{key} -> {name} (uloženo do rules.toml)"),
+                            None => format!("{key} resetováno na auto (uloženo do rules.toml)"),
+                        })
+                    }
+                    Err(err) => Err(err),
+                }
             };
             let _ = reply.send(res);
         }
@@ -1724,7 +2031,7 @@ fn run_single_pipewire_session(
             mainloop_timer.quit();
             return;
         }
-        let _ = state_timer.borrow_mut().reload_from_disk_if_changed(false);
+        state_timer.borrow_mut().periodic_sync();
     });
     let _ = hot_reload_timer.update_timer(Some(HOT_RELOAD_INTERVAL), Some(HOT_RELOAD_INTERVAL));
 
@@ -1746,4 +2053,16 @@ fn run_single_pipewire_session(
 
 fn parse_u32(val: Option<&str>) -> Option<u32> {
     val.and_then(|s| s.trim().parse::<u32>().ok())
+}
+
+fn parse_positive_u32(val: Option<&str>) -> Option<u32> {
+    parse_u32(val).filter(|&v| v > 0)
+}
+
+fn parse_pw_bool(val: &str) -> Option<bool> {
+    match val.trim() {
+        "true" | "1" => Some(true),
+        "false" | "0" => Some(false),
+        _ => None,
+    }
 }

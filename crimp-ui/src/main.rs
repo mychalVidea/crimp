@@ -72,6 +72,7 @@ impl CrimpGuiApp {
     fn reload_rules_and_layout(&mut self) {
         self.client.send_command(IpcRequest::Reload);
         self.patchbay.reload_layout_from_disk();
+        self.settings.reset_dirty_inputs();
     }
 
     fn close_window_to_tray(&mut self, ctx: &egui::Context, snap: &client::UiSnapshot) {

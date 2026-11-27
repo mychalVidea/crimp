@@ -14,10 +14,21 @@ pub struct SettingsViewState {
     max_quantum_input: String,
     quantum_limit_input: String,
     allowed_rates_input: String,
-    initialized_from_runtime: bool,
+    min_quantum_dirty: bool,
+    max_quantum_dirty: bool,
+    quantum_limit_dirty: bool,
+    allowed_rates_dirty: bool,
 }
 
 impl SettingsViewState {
+    pub fn reset_dirty_inputs(&mut self) {
+        self.min_quantum_dirty = false;
+        self.max_quantum_dirty = false;
+        self.quantum_limit_dirty = false;
+        self.allowed_rates_dirty = false;
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub fn show(
         &mut self,
         ui: &mut egui::Ui,
@@ -30,14 +41,45 @@ impl SettingsViewState {
     ) -> bool {
         let mut reload_all_clicked = false;
 
-        if let Some(rt) = runtime
-            && !self.initialized_from_runtime
-        {
-            self.min_quantum_input = rt.clock_min_quantum.clone().unwrap_or_default();
-            self.max_quantum_input = rt.clock_max_quantum.clone().unwrap_or_default();
-            self.quantum_limit_input = rt.clock_quantum_limit.clone().unwrap_or_default();
-            self.allowed_rates_input = rt.clock_allowed_rates.clone().unwrap_or_default();
-            self.initialized_from_runtime = true;
+        if config.is_some() || runtime.is_some() {
+            let desired_min = config
+                .and_then(|c| c.pw_settings.min_quantum.map(|v| v.to_string()))
+                .or_else(|| runtime.and_then(|r| r.clock_min_quantum.clone()));
+            let desired_max = config
+                .and_then(|c| c.pw_settings.max_quantum.map(|v| v.to_string()))
+                .or_else(|| runtime.and_then(|r| r.clock_max_quantum.clone()));
+            let desired_limit = config
+                .and_then(|c| c.pw_settings.quantum_limit.map(|v| v.to_string()))
+                .or_else(|| runtime.and_then(|r| r.clock_quantum_limit.clone()));
+            let desired_rates = config
+                .and_then(|c| {
+                    c.pw_settings
+                        .allowed_rates
+                        .as_deref()
+                        .map(crimp_proto::config::format_allowed_rates)
+                })
+                .or_else(|| runtime.and_then(|r| r.clock_allowed_rates.clone()));
+
+            sync_input_field(
+                &mut self.min_quantum_input,
+                self.min_quantum_dirty,
+                desired_min,
+            );
+            sync_input_field(
+                &mut self.max_quantum_input,
+                self.max_quantum_dirty,
+                desired_max,
+            );
+            sync_input_field(
+                &mut self.quantum_limit_input,
+                self.quantum_limit_dirty,
+                desired_limit,
+            );
+            sync_input_field(
+                &mut self.allowed_rates_input,
+                self.allowed_rates_dirty,
+                desired_rates,
+            );
         }
 
         ScrollArea::vertical().show(ui, |ui| {
@@ -177,8 +219,13 @@ impl SettingsViewState {
                 theme::wide_card(ui, |ui| {
                     theme::section_label(ui, "Výchozí Audio Zařízení ('default')");
                     ui.add_space(8.0);
-                    let cur_sink = runtime.and_then(|r| r.default_audio_sink.as_deref());
-                    let cur_src = runtime.and_then(|r| r.default_audio_source.as_deref());
+                    let saved_sink = config.and_then(|c| c.pw_settings.default_audio_sink.as_deref());
+                    let saved_src =
+                        config.and_then(|c| c.pw_settings.default_audio_source.as_deref());
+                    let cur_sink =
+                        saved_sink.or_else(|| runtime.and_then(|r| r.default_audio_sink.as_deref()));
+                    let cur_src = saved_src
+                        .or_else(|| runtime.and_then(|r| r.default_audio_source.as_deref()));
 
                     let render_devices = |ui: &mut egui::Ui| {
                         let draw_sinks = |ui: &mut egui::Ui| {
@@ -208,6 +255,19 @@ impl SettingsViewState {
                                             });
                                         }
                                     }
+                                }
+                                if saved_sink.is_some()
+                                    && ui
+                                        .button("Auto")
+                                        .on_hover_text(
+                                            "Odstraní připnutý výstup z rules.toml a nechá volbu na WirePlumberu",
+                                        )
+                                        .clicked()
+                                {
+                                    client.send_command(IpcRequest::SetDefaultDevice {
+                                        kind: DefaultDeviceKind::Sink,
+                                        node_name: None,
+                                    });
                                 }
                             });
                         };
@@ -240,6 +300,19 @@ impl SettingsViewState {
                                         }
                                     }
                                 }
+                                if saved_src.is_some()
+                                    && ui
+                                        .button("Auto")
+                                        .on_hover_text(
+                                            "Odstraní připnutý mikrofon z rules.toml a nechá volbu na WirePlumberu",
+                                        )
+                                        .clicked()
+                                {
+                                    client.send_command(IpcRequest::SetDefaultDevice {
+                                        kind: DefaultDeviceKind::Source,
+                                        node_name: None,
+                                    });
+                                }
                             });
                         };
 
@@ -271,6 +344,7 @@ impl SettingsViewState {
                             ui,
                             "clock.min-quantum",
                             &mut self.min_quantum_input,
+                            &mut self.min_quantum_dirty,
                             "32",
                             "Nejnižší buffer, jaký si jakákoliv aplikace smí vyžádat. Pokud ti v hrách praská zvuk, nastav např. 128 nebo 256.",
                             MetadataTarget::Settings,
@@ -280,6 +354,7 @@ impl SettingsViewState {
                             ui,
                             "clock.max-quantum",
                             &mut self.max_quantum_input,
+                            &mut self.max_quantum_dirty,
                             "2048",
                             "Nejvyšší buffer, na jaký smí PipeWire povyrůst při úspoře energie.",
                             MetadataTarget::Settings,
@@ -289,6 +364,7 @@ impl SettingsViewState {
                             ui,
                             "clock.quantum-limit",
                             &mut self.quantum_limit_input,
+                            &mut self.quantum_limit_dirty,
                             "8192",
                             "Tvrdý bezpečnostní strop velikosti bufferu v PipeWire.",
                             MetadataTarget::Settings,
@@ -298,6 +374,7 @@ impl SettingsViewState {
                             ui,
                             "clock.allowed-rates",
                             &mut self.allowed_rates_input,
+                            &mut self.allowed_rates_dirty,
                             "[ 44100 48000 96000 ]",
                             "Povolené vzorkovací frekvence v hranatých závorkách. Např. [ 48000 ] zamezí přepínání frekvencí při hraní/hudbě.",
                             MetadataTarget::Settings,
@@ -307,50 +384,98 @@ impl SettingsViewState {
 
                 ui.add_space(10.0);
                 ui.horizontal_wrapped(|ui| {
-                    let pow2 = runtime
+                    let saved_pow2 = config.and_then(|c| c.pw_settings.power_of_two_quantum);
+                    let live_pow2 = runtime
                         .and_then(|rt| rt.clock_power_of_two.as_deref())
-                        .unwrap_or("-");
+                        .and_then(|v| match v.trim() {
+                            "true" | "1" => Some(true),
+                            "false" | "0" => Some(false),
+                            _ => None,
+                        });
+                    let effective_pow2 = saved_pow2.or(live_pow2);
+                    let pow2_label = match effective_pow2 {
+                        Some(true) => "true",
+                        Some(false) => "false",
+                        None => "auto",
+                    };
                     ui.label(
-                        egui::RichText::new(format!("clock.power-of-two-quantum: {pow2}"))
+                        egui::RichText::new(format!("clock.power-of-two-quantum: {pow2_label}"))
                             .color(theme::TEXT_MUTED),
                     )
                     .on_hover_text(
                         "Pokud je true, velikost bufferu musí být vždy mocnina dvojky (64, 128, 256, 512...). Většina hardwaru vyžaduje true.",
                     );
-                    if ui.button("true").clicked() {
+                    if ui
+                        .selectable_label(effective_pow2 == Some(true), "true")
+                        .clicked()
+                    {
                         client.send_command(IpcRequest::SetPwSetting {
                             target: MetadataTarget::Settings,
                             key: "clock.power-of-two-quantum".into(),
                             value: Some("true".into()),
                         });
                     }
-                    if ui.button("false").clicked() {
+                    if ui
+                        .selectable_label(effective_pow2 == Some(false), "false")
+                        .clicked()
+                    {
                         client.send_command(IpcRequest::SetPwSetting {
                             target: MetadataTarget::Settings,
                             key: "clock.power-of-two-quantum".into(),
                             value: Some("false".into()),
                         });
                     }
-                    if let Some(cfg) = config
-                        && ui
-                            .button("Uložit limity natrvalo do rules.toml")
-                            .on_hover_text(
-                                "Zapíše min/max/limit quantum do konfigurace, takže přežijí i restart PC",
-                            )
-                            .clicked()
+                    if ui
+                        .selectable_label(saved_pow2.is_none(), "Auto")
+                        .on_hover_text("Vrátí power-of-two-quantum na výchozí chování PipeWire")
+                        .clicked()
                     {
-                        let mut next = cfg.clone();
-                        next.pw_settings.min_quantum = self.min_quantum_input.trim().parse().ok();
-                        next.pw_settings.max_quantum = self.max_quantum_input.trim().parse().ok();
-                        next.pw_settings.quantum_limit =
-                            self.quantum_limit_input.trim().parse().ok();
-                        let rates_raw = self.allowed_rates_input.trim();
-                        next.pw_settings.allowed_rates = if rates_raw.is_empty() {
-                            None
-                        } else {
-                            crimp_proto::config::parse_allowed_rates_list(rates_raw).ok()
-                        };
-                        client.send_command(IpcRequest::SaveConfig { config: next });
+                        client.send_command(IpcRequest::SetPwSetting {
+                            target: MetadataTarget::Settings,
+                            key: "clock.power-of-two-quantum".into(),
+                            value: None,
+                        });
+                    }
+                    if ui
+                        .button("Uložit limity natrvalo do rules.toml")
+                        .on_hover_text(
+                            "Zapíše min/max/limit quantum a allowed-rates do konfigurace, takže přežijí i restart PC",
+                        )
+                        .clicked()
+                    {
+                        match (
+                            parse_opt_u32_limit("clock.min-quantum", &self.min_quantum_input),
+                            parse_opt_u32_limit("clock.max-quantum", &self.max_quantum_input),
+                            parse_opt_u32_limit("clock.quantum-limit", &self.quantum_limit_input),
+                            parse_opt_allowed_rates(&self.allowed_rates_input),
+                        ) {
+                            (Ok(min_q), Ok(max_q), Ok(lim_q), Ok(rates)) => {
+                                if let (Some(min_v), Some(max_v)) = (min_q, max_q)
+                                    && min_v > max_v
+                                {
+                                    client.push_feedback(
+                                        true,
+                                        format!(
+                                            "clock.min-quantum ({min_v}) nesmí být větší než clock.max-quantum ({max_v})"
+                                        ),
+                                    );
+                                } else {
+                                    client.send_command(IpcRequest::SavePwLimits {
+                                        min_quantum: min_q,
+                                        max_quantum: max_q,
+                                        quantum_limit: lim_q,
+                                        allowed_rates: rates,
+                                    });
+                                    self.reset_dirty_inputs();
+                                }
+                            }
+                            (Err(e), _, _, _)
+                            | (_, Err(e), _, _)
+                            | (_, _, Err(e), _)
+                            | (_, _, _, Err(e)) => {
+                                client.push_feedback(true, e);
+                            }
+                        }
                     }
                 });
             });
@@ -683,10 +808,42 @@ fn kv(ui: &mut egui::Ui, label: &str, value: &str, tooltip: &str) {
     });
 }
 
+fn sync_input_field(buf: &mut String, dirty: bool, desired: Option<String>) {
+    if !dirty {
+        *buf = desired.unwrap_or_default();
+    }
+}
+
+fn parse_opt_u32_limit(key: &str, raw: &str) -> Result<Option<u32>, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let val = trimmed
+        .parse::<u32>()
+        .map_err(|_| format!("Neplatné číslo pro {key}: '{trimmed}'"))?;
+    if val == 0 {
+        return Err(format!(
+            "{key} musí být kladné číslo (nebo prázdné pro Auto)"
+        ));
+    }
+    Ok(Some(val))
+}
+
+fn parse_opt_allowed_rates(raw: &str) -> Result<Option<Vec<u32>>, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    crimp_proto::config::parse_allowed_rates_list(trimmed).map(Some)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn setting_row(
     ui: &mut egui::Ui,
     key: &str,
     buf: &mut String,
+    dirty: &mut bool,
     hint: &str,
     tooltip: &str,
     target: MetadataTarget,
@@ -694,12 +851,16 @@ fn setting_row(
 ) {
     ui.label(egui::RichText::new(key).monospace())
         .on_hover_text(tooltip);
-    ui.add(
-        egui::TextEdit::singleline(buf)
-            .desired_width(220.0)
-            .hint_text(hint),
-    )
-    .on_hover_text(tooltip);
+    let edit = ui
+        .add(
+            egui::TextEdit::singleline(buf)
+                .desired_width(220.0)
+                .hint_text(hint),
+        )
+        .on_hover_text(tooltip);
+    if edit.changed() {
+        *dirty = true;
+    }
     ui.horizontal(|ui| {
         if ui.button("Použít").clicked() {
             let trimmed = buf.trim();
@@ -708,6 +869,7 @@ fn setting_row(
             } else {
                 Some(trimmed.to_string())
             };
+            *dirty = false;
             client.send_command(IpcRequest::SetPwSetting {
                 target,
                 key: key.to_string(),
@@ -716,6 +878,7 @@ fn setting_row(
         }
         if ui.button("Auto").clicked() {
             buf.clear();
+            *dirty = false;
             client.send_command(IpcRequest::SetPwSetting {
                 target,
                 key: key.to_string(),
