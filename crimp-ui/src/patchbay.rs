@@ -410,7 +410,7 @@ impl PatchbayState {
             if ui
                 .selectable_label(self.stereo_link_mode, "Stereo L+R")
                 .on_hover_text(
-                    "Když je zapnuto (nebo držíš Shift při tahání kabelu), jedním tahem propojíš celý stereo pár (FL→FL + FR→FR) najednou.",
+                    "Když je zapnuto (nebo držíš Shift při tahání kabelu), jedním tahem propojíš celý stereo pár (FL->FL + FR->FR) najednou.",
                 )
                 .clicked()
             {
@@ -1736,7 +1736,7 @@ impl PatchbayState {
             ui.add_space(10.0);
             ui.label(
                 egui::RichText::new(
-                    "Ovládání: Přetažením nebo kliknutím z libovolného konce (zelený ↔ modrý) propojíš porty. Podržením Shift nebo tlačítkem Stereo L+R spojíš oba kanály najednou. Pravý klik na drát nebo Delete odpojí, Ctrl+Z / Ctrl+Y vrací změny zpět. Klik na % / MUTE na kartě rychle ztlumí uzel.",
+                    "Ovládání: Přetažením nebo kliknutím z libovolného konce (zelený <-> modrý) propojíš porty. Podržením Shift nebo tlačítkem Stereo L+R spojíš oba kanály najednou. Pravý klik na drát nebo Delete odpojí, Ctrl+Z / Ctrl+Y vrací změny zpět. Klik na % / MUTE na kartě rychle ztlumí uzel.",
                 )
                 .color(theme::TEXT_SUBTLE)
                 .size(11.5),

@@ -37,6 +37,7 @@ struct CrimpGuiApp {
     rules: RulesViewState,
     last_feedback: Option<ActionFeedback>,
     last_feedback_at: Option<Instant>,
+    xrun_baseline: std::collections::BTreeMap<u32, u64>,
 }
 
 impl CrimpGuiApp {
@@ -61,6 +62,7 @@ impl CrimpGuiApp {
             rules: RulesViewState::default(),
             last_feedback: None,
             last_feedback_at: None,
+            xrun_baseline: std::collections::BTreeMap::new(),
         }
     }
 
@@ -199,36 +201,81 @@ impl eframe::App for CrimpGuiApp {
 
                     if snap.audio_health.available {
                         theme::spec_divider(ui);
-                        let xruns = snap.audio_health.total_xruns;
-                        let (xrun_txt, xrun_col) = if xruns == 0 {
+                        let mut offenders: Vec<_> = snap
+                            .audio_health
+                            .per_node
+                            .values()
+                            .filter_map(|m| {
+                                let base = self.xrun_baseline.get(&m.id).copied().unwrap_or(0);
+                                let delta = m.err_count.saturating_sub(base);
+                                (delta > 0 || m.err_count > 0).then_some((m, delta))
+                            })
+                            .collect();
+                        offenders.sort_by_key(|(m, delta)| {
+                            (std::cmp::Reverse(*delta), std::cmp::Reverse(m.err_count))
+                        });
+
+                        let new_xruns: u64 = offenders
+                            .iter()
+                            .map(|(_, d)| *d)
+                            .fold(0u64, u64::saturating_add);
+                        let total_xruns = snap.audio_health.total_xruns;
+                        let (xrun_txt, xrun_col) = if new_xruns == 0 {
                             ("0 xruns".to_string(), theme::ECONOMY_GREEN)
                         } else {
-                            (format!("{xruns} xruns"), theme::DANGER_RED)
+                            (format!("{new_xruns} xruns"), theme::DANGER_RED)
                         };
-                        let mut tip = if xruns == 0 {
+                        let mut tip = if new_xruns == 0 && total_xruns == 0 {
                             format!(
                                 "Zvuk běží čistě bez výpadků (aktivních uzlů: {}).",
                                 snap.audio_health.active_nodes
                             )
+                        } else if new_xruns == 0 {
+                            format!(
+                                "Od vynulování: 0 nových výpadků (celkem od startu PipeWire: {total_xruns})."
+                            )
                         } else {
-                            let offenders: Vec<String> = snap
-                                .audio_health
-                                .per_node
-                                .values()
-                                .filter(|m| m.err_count > 0)
-                                .take(5)
-                                .map(|m| format!("• {} (#{}): {}×", m.name, m.id, m.err_count))
+                            let lines: Vec<String> = offenders
+                                .iter()
+                                .filter(|(_, d)| *d > 0)
+                                .take(6)
+                                .map(|(m, d)| {
+                                    let label = snap
+                                        .graph
+                                        .as_ref()
+                                        .and_then(|g| g.nodes.iter().find(|n| n.id == m.id))
+                                        .map_or(m.name.as_str(), |n| n.label.as_str());
+                                    format!("• {label} (#{}): {d}×", m.id)
+                                })
                                 .collect();
                             format!(
-                                "Detekovány výpadky zvuku (xruns)!\n{}\nTip: zvedni Quantum (např. 256 → 512) v PipeWire Settings.",
-                                offenders.join("\n")
+                                "Detekovány výpadky zvuku (xruns)!\n{}\nTip: zvedni Quantum (např. 256 -> 512) v PipeWire Settings.\nKliknutím na číslo vynuluješ počítadlo a můžeš sledovat jen nové výpadky.",
+                                lines.join("\n")
                             )
                         };
-                        if snap.audio_health.active_nodes == 0 && xruns == 0 {
+                        if snap.audio_health.active_nodes == 0
+                            && new_xruns == 0
+                            && total_xruns == 0
+                        {
                             tip = "PipeWire profiler aktivní · žádné výpadky (xruns).".into();
                         }
-                        ui.label(egui::RichText::new(xrun_txt).color(xrun_col).size(12.5))
-                            .on_hover_text(tip);
+                        if ui
+                            .add(
+                                egui::Label::new(
+                                    egui::RichText::new(xrun_txt).color(xrun_col).size(12.5),
+                                )
+                                .sense(egui::Sense::click()),
+                            )
+                            .on_hover_text(tip)
+                            .clicked()
+                        {
+                            self.xrun_baseline = snap
+                                .audio_health
+                                .per_node
+                                .iter()
+                                .map(|(&id, m)| (id, m.err_count))
+                                .collect();
+                        }
                     }
 
                     if !snap.scenes.is_empty() {

@@ -109,13 +109,7 @@ pub fn parse_pw_top_batch(raw: &str) -> AudioHealthSnapshot {
         let rate = cols[3].parse::<u32>().unwrap_or(0);
         let busy_ratio = parse_pw_top_float(cols[7]).unwrap_or(0.0).max(0.0);
         let err_count = cols[8].parse::<u64>().unwrap_or(0);
-        let name = if cols.len() > 10 {
-            cols[10..].join(" ")
-        } else if cols.len() > 9 {
-            cols[9].to_string()
-        } else {
-            String::new()
-        };
+        let name = extract_pw_top_node_name(&cols[9..]);
 
         snap.available = true;
         if state == NodeActivityState::Running {
@@ -145,6 +139,25 @@ fn parse_pw_top_float(raw: &str) -> Option<f32> {
         return None;
     }
     clean.parse::<f32>().ok()
+}
+
+fn extract_pw_top_node_name(tail: &[&str]) -> String {
+    if tail.is_empty() {
+        return String::new();
+    }
+    // Sloupec FORMAT má typicky 3 tokeny: `<FORMÁT> <KANÁLY> <RATE>` (např. `S32LE 2 96000`),
+    // přičemž child streamy mají před názvem ještě `+` (např. `+ OBS`).
+    let mut start = 0usize;
+    if tail.len() >= 4
+        && tail[1].chars().all(|c| c.is_ascii_digit())
+        && tail[2].chars().all(|c| c.is_ascii_digit())
+    {
+        start = 3;
+    }
+    if tail.get(start) == Some(&"+") && tail.len() > start + 1 {
+        start += 1;
+    }
+    tail[start..].join(" ")
 }
 
 /// Zparsuje hlasitosti všech uzlů z hromadného výstupu `wpctl status`.
@@ -235,10 +248,12 @@ I  108      0      0    ---     ---   ---   ---     0    F32LE 2 48000 cs2
         assert_eq!(sink.quantum, 512);
         assert_eq!(sink.rate, 96000);
         assert_eq!(sink.err_count, 3);
+        assert_eq!(sink.name, "alsa_output.pci-0000.analog-stereo");
         assert!((sink.busy_ratio - 0.04).abs() < 0.001);
 
         let cs2 = snap.per_node.get(&108).expect("cs2 metrics");
         assert_eq!(cs2.state, NodeActivityState::Idle);
+        assert_eq!(cs2.name, "cs2");
     }
 
     #[test]
