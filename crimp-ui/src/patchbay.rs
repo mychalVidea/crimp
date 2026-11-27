@@ -4,7 +4,7 @@ use crate::layout_store::{
     pos_to_arr, save_layout, vec_to_arr,
 };
 use crate::theme;
-use crimp_proto::config::{AliasRule, Config, DenyRule, DspProfileRule, NodeMatcher, RouteRule};
+use crimp_proto::config::{AliasRule, Config, DenyRule, NodeMatcher, RouteRule};
 use crimp_proto::graph::{GraphSnapshot, NodeSnapshot, PortInfo};
 use crimp_proto::ipc::{DefaultDeviceKind, IpcRequest};
 use crimp_proto::telemetry::{AudioHealthSnapshot, NodeActivityState, NodeVolumeState};
@@ -76,10 +76,6 @@ pub struct PatchbayState {
     selected_link_id: Option<u32>,
     alias_input: String,
     alias_for_node_id: Option<u32>,
-    dsp_for_node_id: Option<u32>,
-    dsp_quantum_choice: Option<u32>,
-    dsp_rate_choice: Option<u32>,
-    dsp_priority: i32,
     filter_query: String,
     undo_stack: Vec<UndoEntry>,
     redo_stack: Vec<UndoEntry>,
@@ -112,10 +108,6 @@ impl Default for PatchbayState {
             selected_link_id: None,
             alias_input: String::new(),
             alias_for_node_id: None,
-            dsp_for_node_id: None,
-            dsp_quantum_choice: Some(512),
-            dsp_rate_choice: Some(48_000),
-            dsp_priority: 50,
             filter_query: String::new(),
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
@@ -1557,108 +1549,6 @@ impl PatchbayState {
                         );
                         if slider.changed() {
                             client.set_node_volume(node.id, pct / 100.0);
-                        }
-                    });
-                }
-
-                // Auto DSP profil pro vybranou aplikaci / uzel ([[dsp_profile]])
-                if let Some(cfg) = config {
-                    let matcher = node_to_matcher(node);
-                    let existing_idx = cfg.dsp_profile.iter().position(|p| p.source == matcher);
-                    if self.dsp_for_node_id != Some(node.id) {
-                        self.dsp_for_node_id = Some(node.id);
-                        if let Some(idx) = existing_idx {
-                            self.dsp_quantum_choice = cfg.dsp_profile[idx].quantum;
-                            self.dsp_rate_choice = cfg.dsp_profile[idx].rate;
-                            self.dsp_priority = cfg.dsp_profile[idx].priority;
-                        } else {
-                            self.dsp_quantum_choice = Some(512);
-                            self.dsp_rate_choice = Some(48_000);
-                            self.dsp_priority = 50;
-                        }
-                    }
-
-                    ui.add_space(10.0);
-                    ui.label(
-                        egui::RichText::new("Auto DSP profil (když běží tato aplikace)")
-                            .size(12.0)
-                            .color(theme::TEXT_MUTED),
-                    )
-                    .on_hover_text(
-                        "Po spuštění této aplikace Crimp automaticky přepne buffer / frekvenci a po jejím zavření vrátí globální nastavení.",
-                    );
-                    ui.horizontal(|ui| {
-                        let q_lbl = self
-                            .dsp_quantum_choice
-                            .map_or_else(|| "Auto".into(), |q| format!("{q}"));
-                        egui::ComboBox::from_id_salt(("insp_dsp_q", node.id))
-                            .selected_text(format!("Q: {q_lbl}"))
-                            .width(96.0)
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(&mut self.dsp_quantum_choice, None, "Auto");
-                                for q in [64u32, 128, 256, 512, 1024, 2048] {
-                                    ui.selectable_value(
-                                        &mut self.dsp_quantum_choice,
-                                        Some(q),
-                                        format!("{q}"),
-                                    );
-                                }
-                            });
-                        let r_lbl = self
-                            .dsp_rate_choice
-                            .map_or_else(|| "Auto".into(), |r| format!("{r} Hz"));
-                        egui::ComboBox::from_id_salt(("insp_dsp_r", node.id))
-                            .selected_text(r_lbl)
-                            .width(114.0)
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(&mut self.dsp_rate_choice, None, "Auto");
-                                for r in [44_100u32, 48_000, 88_200, 96_000, 192_000] {
-                                    ui.selectable_value(
-                                        &mut self.dsp_rate_choice,
-                                        Some(r),
-                                        format!("{r} Hz"),
-                                    );
-                                }
-                            });
-                    });
-                    ui.horizontal(|ui| {
-                        if ui.button("Uložit DSP profil").clicked() && !matcher.is_empty() {
-                            let mut next = cfg.clone();
-                            let rule = DspProfileRule {
-                                name: format!("Auto DSP: {}", node.label),
-                                enabled: true,
-                                source: matcher.clone(),
-                                quantum: self.dsp_quantum_choice,
-                                rate: self.dsp_rate_choice,
-                                priority: self.dsp_priority,
-                            };
-                            if let Some(idx) = existing_idx {
-                                next.dsp_profile[idx] = rule;
-                            } else {
-                                next.dsp_profile.push(rule);
-                            }
-                            self.push_undo(UndoEntry {
-                                label: format!("DSP profil pro {}", node.label),
-                                prev_config: Some(cfg.clone()),
-                                next_config: Some(next.clone()),
-                                undo_links: Vec::new(),
-                                redo_links: Vec::new(),
-                            });
-                            client.send_command(IpcRequest::SaveConfig { config: next });
-                        }
-                        if let Some(idx) = existing_idx
-                            && ui.button("Smazat profil").clicked()
-                        {
-                            let mut next = cfg.clone();
-                            next.dsp_profile.remove(idx);
-                            self.push_undo(UndoEntry {
-                                label: format!("Smazání DSP profilu {}", node.label),
-                                prev_config: Some(cfg.clone()),
-                                next_config: Some(next.clone()),
-                                undo_links: Vec::new(),
-                                redo_links: Vec::new(),
-                            });
-                            client.send_command(IpcRequest::SaveConfig { config: next });
                         }
                     });
                 }
