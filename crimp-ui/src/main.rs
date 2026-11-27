@@ -201,10 +201,19 @@ impl eframe::App for CrimpGuiApp {
 
                     if snap.audio_health.available {
                         theme::spec_divider(ui);
+                        let is_video_node = |node_id: u32| -> bool {
+                            snap.graph
+                                .as_ref()
+                                .and_then(|g| g.nodes.iter().find(|n| n.id == node_id))
+                                .and_then(|n| n.media_class.as_deref())
+                                .is_some_and(|c| c.contains("Video"))
+                        };
+
                         let mut offenders: Vec<_> = snap
                             .audio_health
                             .per_node
                             .values()
+                            .filter(|m| !is_video_node(m.id))
                             .filter_map(|m| {
                                 let base = self.xrun_baseline.get(&m.id).copied().unwrap_or(0);
                                 let delta = m.err_count.saturating_sub(base);
@@ -215,24 +224,45 @@ impl eframe::App for CrimpGuiApp {
                             (std::cmp::Reverse(*delta), std::cmp::Reverse(m.err_count))
                         });
 
-                        let new_xruns: u64 = offenders
+                        let new_audio_xruns: u64 = offenders
                             .iter()
                             .map(|(_, d)| *d)
                             .fold(0u64, u64::saturating_add);
-                        let total_xruns = snap.audio_health.total_xruns;
-                        let (xrun_txt, xrun_col) = if new_xruns == 0 {
+                        let total_audio_xruns: u64 = snap
+                            .audio_health
+                            .per_node
+                            .values()
+                            .filter(|m| !is_video_node(m.id))
+                            .map(|m| m.err_count)
+                            .fold(0u64, u64::saturating_add);
+                        let video_xruns: u64 = snap
+                            .audio_health
+                            .per_node
+                            .values()
+                            .filter(|m| is_video_node(m.id))
+                            .map(|m| m.err_count)
+                            .fold(0u64, u64::saturating_add);
+
+                        let (xrun_txt, xrun_col) = if new_audio_xruns == 0 {
                             ("0 xruns".to_string(), theme::ECONOMY_GREEN)
                         } else {
-                            (format!("{new_xruns} xruns"), theme::DANGER_RED)
+                            (format!("{new_audio_xruns} xruns"), theme::DANGER_RED)
                         };
-                        let mut tip = if new_xruns == 0 && total_xruns == 0 {
+                        let video_note = if video_xruns > 0 {
                             format!(
-                                "Zvuk běží čistě bez výpadků (aktivních uzlů: {}).",
+                                "\n(Mimo to {video_xruns}× u Video/Screencast streamů OBS/KWin – nemá vliv na zvuk)"
+                            )
+                        } else {
+                            String::new()
+                        };
+                        let mut tip = if new_audio_xruns == 0 && total_audio_xruns == 0 {
+                            format!(
+                                "Zvuk běží čistě bez výpadků (aktivních uzlů: {}).{video_note}",
                                 snap.audio_health.active_nodes
                             )
-                        } else if new_xruns == 0 {
+                        } else if new_audio_xruns == 0 {
                             format!(
-                                "Od vynulování: 0 nových výpadků (celkem od startu PipeWire: {total_xruns})."
+                                "Od vynulování: 0 nových audio výpadků (celkem od startu PipeWire: {total_audio_xruns}).{video_note}"
                             )
                         } else {
                             let lines: Vec<String> = offenders
@@ -249,13 +279,14 @@ impl eframe::App for CrimpGuiApp {
                                 })
                                 .collect();
                             format!(
-                                "Detekovány výpadky zvuku (xruns)!\n{}\nTip: zvedni Quantum (např. 256 -> 512) v PipeWire Settings.\nKliknutím na číslo vynuluješ počítadlo a můžeš sledovat jen nové výpadky.",
+                                "Detekovány výpadky zvuku (xruns)!\n{}{video_note}\nTip: zvedni Quantum (např. 256 -> 512) v PipeWire Settings.\nKliknutím na číslo vynuluješ počítadlo a můžeš sledovat jen nové výpadky.",
                                 lines.join("\n")
                             )
                         };
                         if snap.audio_health.active_nodes == 0
-                            && new_xruns == 0
-                            && total_xruns == 0
+                            && new_audio_xruns == 0
+                            && total_audio_xruns == 0
+                            && video_xruns == 0
                         {
                             tip = "PipeWire profiler aktivní · žádné výpadky (xruns).".into();
                         }
